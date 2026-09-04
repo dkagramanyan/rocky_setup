@@ -1,72 +1,135 @@
-# rocky9-gpu-node
+<h1 align="center">rocky_setup</h1>
 
-Provisioning and unattended maintenance for Rocky Linux 9 GPU compute nodes.
-Two scripts: one that builds a node from scratch, one that keeps it clean and
-current from cron.
+## Provisioning and maintenance for Rocky Linux 9 GPU nodes
 
-## Layout
+One self-contained script. It builds a node from scratch, keeps it clean and
+current on a schedule, and gives you a menu when you run it with no arguments.
 
-```
-bin/bootstrap-gpu-node.sh    one-shot provisioning: driver, CUDA, docker, firewall
-bin/node-maintenance.sh      recurring cleanup and update
-config/node-maintenance.env  all tunables, installed to /etc/sysconfig/
-cron/                        daily clean, weekly full run
-systemd/                     timer alternative to cron
-logrotate/                   rotation for the script's own logs
-install.sh                   deploys the above
-docs/nvidia-cuda.md          driver and CUDA reference, troubleshooting
-docs/storage.md              /boot pressure, moving docker and containerd to /home
-docs/firewall-and-ports.md   firewalld policy, GPUStack port list
-```
+## What it does
+
+- **Bootstrap** a fresh node: NVIDIA driver (open DKMS modules), CUDA toolkit,
+  docker relocated to `/home`, nvidia-container-toolkit, firewalld off,
+  versionlock on the NVIDIA stack.
+- **Maintenance**, unattended: kernel pruning before the upgrade so `/boot` has
+  room for the new initramfs, `dnf upgrade` with your excludes, journal vacuum,
+  rotated logs, core dumps, `/tmp` and `/var/tmp` by atime, pip/uv/npm caches,
+  `docker`/`podman` prune, GPU and `dkms` report, reboot policy.
+- **Guards**: `flock` against overlapping runs, a busy check on `nvidia-smi`
+  compute processes and `squeue`, a `/boot` free-space floor, and per-node
+  start jitter so a cluster does not hit the mirrors at once.
+- **Schedule**: installs itself as a cron job or a systemd timer, running
+  **every 2 weeks, Saturday 08:00 MSK (GMT+3)**.
+
+## Requirements
+
+- Rocky Linux 9 (or a RHEL 9 rebuild), root or sudo.
+- For the GPU stages: an NVIDIA card on the PCI bus, Secure Boot off.
 
 ## Install
 
+1. Clone the repository
+
+    ```bash
+    git clone https://github.com/dkagramanyan/rocky_setup.git && cd rocky_setup
+    ```
+
+2. Make it executable
+
+    ```bash
+    chmod +x node-setup.sh
+    ```
+
+3. Run it
+
+    ```bash
+    sudo ./node-setup.sh
+    ```
+
+4. Or in one command (needs sudo)
+
+    ```bash
+    sudo bash <(curl -fsSL https://raw.githubusercontent.com/dkagramanyan/rocky_setup/main/node-setup.sh)
+    ```
+
+Non-interactive, for a fleet:
+
 ```bash
-git clone <this-repo> && cd rocky9-gpu-node
-sudo ./install.sh                  # cron
-sudo USE_TIMER=1 ./install.sh      # systemd timer instead
-sudo node-maintenance.sh --dry-run
+sudo ./node-setup.sh bootstrap             # new node, reboots twice, re-run after each
+sudo ./node-setup.sh install               # cron, every 2 weeks Sat 08:00 MSK
+sudo ./node-setup.sh install --timer       # systemd timer instead
+sudo ./node-setup.sh maintenance --dry-run # verify, change nothing
 ```
 
-New node from scratch:
+## Schedule
 
-```bash
-sudo ./bin/bootstrap-gpu-node.sh   # reboots twice, re-run after each
-```
+The cron job and the timer both fire **every Saturday at 08:00 Europe/Moscow**;
+`--scheduled` makes the script exit early on odd ISO weeks, so a run actually
+lands every 2 weeks. `MAINT_JITTER_SEC=1800` then spreads the cluster over the
+following half hour.
+
+| | |
+|---|---|
+| cron | `CRON_TZ=Europe/Moscow` + `0 8 * * 6` in `/etc/cron.d/node-maintenance` |
+| timer | `OnCalendar=Sat *-*-* 08:00:00 Europe/Moscow`, falls back to `05:00 UTC` if systemd rejects the timezone |
+| every 2 weeks | `MAINT_BIWEEKLY=1` — run only when the ISO week number is even |
+
+Set `MAINT_BIWEEKLY=0` in `/etc/sysconfig/node-maintenance` for a weekly run.
+The gap is exactly 14 days except once across a 53-week year boundary.
 
 ## What the maintenance run does
 
-1. `flock`, so overlapping cron runs cannot collide.
-2. Exits 10 if `nvidia-smi` shows compute processes or `squeue` shows jobs here.
-3. Prunes kernels to `MAINT_KEEP_KERNELS` and deletes orphaned `initramfs`,
+1. `flock`, so overlapping runs cannot collide.
+2. Exits 0 if this is an odd ISO week and `MAINT_BIWEEKLY=1`.
+3. Exits 10 if `nvidia-smi` shows compute processes or `squeue` shows jobs here.
+4. Prunes kernels to `MAINT_KEEP_KERNELS` and deletes orphaned `initramfs`,
    `vmlinuz`, `System.map`, `config` and BLS loader entries. Before the upgrade,
    because a full `/boot` is what breaks kernel installs on these nodes.
-4. Skips the upgrade entirely if `/boot` is still under `MAINT_BOOT_MIN_FREE_MB`.
-5. `dnf upgrade` with the configured excludes, `dnf clean all`.
-6. Journal vacuum, rotated logs, core dumps, `/tmp` and `/var/tmp` by atime,
+5. Skips the upgrade entirely if `/boot` is still under `MAINT_BOOT_MIN_FREE_MB`.
+6. `dnf upgrade` with the configured excludes, `dnf clean all`.
+7. Journal vacuum, rotated logs, core dumps, `/tmp` and `/var/tmp` by atime,
    pip/uv/npm caches, `docker`/`podman` prune.
-7. Disables and masks `firewalld` when `MAINT_DISABLE_FIREWALL=1`.
-8. Reports GPU state, `dkms status`, and the `nvidia` module license.
-9. `needs-restarting -r`, then acts on `MAINT_REBOOT_MODE`.
+8. Disables and masks `firewalld` when `MAINT_DISABLE_FIREWALL=1`.
+9. Reports GPU state, `dkms status`, and the `nvidia` module license.
+10. `needs-restarting -r`, then acts on `MAINT_REBOOT_MODE`.
 
 Log: `/var/log/node-maintenance/latest.log`.
 
-## Options and exit codes
+## Commands and exit codes
 
 ```
-node-maintenance.sh                clean + update
-node-maintenance.sh --clean-only   no package upgrade
-node-maintenance.sh --update-only  kernel pruning + upgrade only
-node-maintenance.sh --dry-run      print, change nothing
-node-maintenance.sh --force        ignore the busy guard
+node-setup.sh                       interactive menu
+node-setup.sh bootstrap [stages]    base repos nouveau driver cuda toolkit docker firewall lock
+node-setup.sh maintenance           clean + update now
+node-setup.sh install [--timer]     deploy the script, config and schedule
+node-setup.sh uninstall             remove the schedule, keep script, config, logs
+node-setup.sh status                what is installed, when it next runs
 ```
+
+Maintenance options: `--clean-only`, `--update-only`, `--dry-run`, `--force`
+(ignore the busy guard), `--scheduled` (honour `MAINT_BIWEEKLY`).
 
 | Code | Meaning |
 |---|---|
-| 0 | success |
+| 0 | success, or skipped on an odd week |
 | 10 | skipped, node was busy |
 | 20 | finished, one or more steps failed |
 | 30 | another instance was already running |
+
+## Installed layout
+
+```
+/usr/local/sbin/node-setup.sh        the script
+/etc/sysconfig/node-maintenance      all tunables
+/etc/cron.d/node-maintenance         or /etc/systemd/system/node-maintenance.{service,timer}
+/etc/logrotate.d/node-maintenance    rotation for the script's own logs
+/var/log/node-maintenance/           logs, latest.log is a symlink to the newest
+docs/nvidia-cuda.md                  driver and CUDA reference, troubleshooting
+docs/storage.md                      /boot pressure, moving docker and containerd to /home
+docs/firewall-and-ports.md           firewalld policy, GPUStack port list
+```
+
+`install` keeps an existing config and drops the new defaults next to it as
+`/etc/sysconfig/node-maintenance.new`.
 
 ## Two decisions to make per cluster
 
@@ -93,3 +156,43 @@ df -h /boot
 ```
 
 Still tight? Set `MAINT_DROP_RESCUE=1` to drop the `0-rescue` image.
+
+## How it looks
+
+```
+┌────────────────────────────────────────────┐
+│ ██████╗  ██████╗  ██████╗██╗  ██╗██╗   ██╗ │
+│ ██╔══██╗██╔═══██╗██╔════╝██║ ██╔╝╚██╗ ██╔╝ │
+│ ██████╔╝██║   ██║██║     █████╔╝  ╚████╔╝  │
+│ ██╔══██╗██║   ██║██║     ██╔═██╗   ╚██╔╝   │
+│ ██║  ██║╚██████╔╝╚██████╗██║  ██╗   ██║    │
+│ ╚═╝  ╚═╝ ╚═════╝  ╚═════╝╚═╝  ╚═╝   ╚═╝    │
+└────────────────────────────────────────────┘
+rocky9-gpu-node — provisioning and maintenance for Rocky Linux 9 GPU nodes
+Version: 2.0
+Schedule: every 2 weeks, Saturday 08:00 MSK (even ISO weeks)
+
+─────────────────────────────────────────────
+        Rocky 9 GPU node — MENU
+─────────────────────────────────────────────
+1. Bootstrap this node (driver, CUDA, docker)
+2. Run maintenance now (clean + update)
+3. Dry run (print, change nothing)
+4. Install schedule — cron
+5. Install schedule — systemd timer
+6. Remove schedule
+7. Status
+0. Exit
+─────────────────────────────────────────────
+Choose an action [0-7]:
+```
+
+## Upgrading from v1
+
+v1 shipped `install.sh`, `bin/`, `config/`, `cron/`, `systemd/` and
+`logrotate/`; all of it is now inside `node-setup.sh`. `sudo ./node-setup.sh
+install` overwrites `/etc/cron.d/node-maintenance` with the new biweekly entry
+and keeps your `/etc/sysconfig/node-maintenance`. The old
+`/usr/local/sbin/node-maintenance.sh` and `bootstrap-gpu-node.sh` are left in
+place and no longer referenced — remove them by hand once the new schedule has
+run.
