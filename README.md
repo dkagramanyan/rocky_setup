@@ -14,6 +14,8 @@ current on a schedule, and gives you a menu when you run it with no arguments.
   room for the new initramfs, `dnf upgrade` with your excludes, journal vacuum,
   rotated logs, core dumps, `/tmp` and `/var/tmp` by atime, pip/uv/npm caches,
   `docker`/`podman` prune, GPU and `dkms` report, reboot policy.
+- **What it never deletes**: tagged container images, and anything that looks
+  like a model store — see below.
 - **Logical volumes**: reports the volume groups, logical volumes, snapshots
   and free extents, and runs `fstrim -av` so the SSD learns which blocks the
   filesystems no longer use. It never resizes or removes a volume.
@@ -92,13 +94,33 @@ The gap is exactly 14 days except once across a 53-week year boundary.
 5. Skips the upgrade entirely if `/boot` is still under `MAINT_BOOT_MIN_FREE_MB`.
 6. `dnf upgrade` with the configured excludes, `dnf clean all`.
 7. Journal vacuum, rotated logs, core dumps, `/tmp` and `/var/tmp` by atime,
-   pip/uv/npm caches, `docker`/`podman` prune.
+   pip/uv/npm caches, `docker`/`podman` prune (see below).
 8. Logs `vgs`/`lvs` and runs `fstrim -av` when `MAINT_FSTRIM=1`.
 9. Disables and masks `firewalld` when `MAINT_DISABLE_FIREWALL=1`.
 10. Reports GPU state, `dkms status`, and the `nvidia` module license.
 11. `needs-restarting -r`, then acts on `MAINT_REBOOT_MODE`.
 
 Log: `/var/log/node-maintenance/latest.log`.
+
+## What the cleanup will not touch
+
+**Container images.** The prune is `docker system prune -f`, deliberately
+without `-a`. It removes stopped containers, unused networks, dangling
+(untagged) layers and build cache. Every tagged image stays, whether or not a
+container is currently running it. `prune -a` would delete the images people
+actually work with, which is not something a cron job should decide.
+
+**Model weights.** Weights are read rarely, so ageing a cache by atime would
+delete exactly the wrong files. Any directory whose path contains `gpustack`,
+`huggingface`, `ollama`, `modelscope`, `torch/hub`, or ends in `/hub`, `/model`
+or `/models` is skipped by name, even if it is listed in `MAINT_CACHE_DIRS`:
+
+```
+SKIP /var/lib/gpustack — looks like a model store, not touching it
+```
+
+`MAINT_CACHE_DIRS` should point at rebuildable caches — pip, uv, npm — and
+never at a model store.
 
 ## When the node is busy
 

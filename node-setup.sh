@@ -199,13 +199,21 @@ maintenance() (
         run systemd-tmpfiles --clean
         for d in /tmp /var/tmp /root/.cache/pip /root/.cache/uv /root/.npm/_cacache $MAINT_CACHE_DIRS; do
             [[ -d $d ]] || continue
+            if is_model_store "$d"; then
+                log "SKIP $d — looks like a model store, not touching it"
+                continue
+            fi
             log "$(du -sh "$d" 2>/dev/null | cut -f1) in $d"
             ((DRY)) || { find "$d" -xdev -mindepth 1 -type f -atime "+$MAINT_TMP_AGE_DAYS" -delete 2>/dev/null
                          find "$d" -xdev -mindepth 1 -type d -empty -atime "+$MAINT_TMP_AGE_DAYS" -delete 2>/dev/null; }
         done
         if ((MAINT_PRUNE_CONTAINERS)); then
-            systemctl is-active --quiet docker && run docker system prune -af --filter until=168h
-            command -v podman >/dev/null && run podman system prune -af --filter until=168h
+            # No -a. `prune -a` deletes every image that is not currently in a
+            # running container, which on these nodes means the images people
+            # actually work with. Without it only stopped containers, unused
+            # networks, dangling (untagged) layers and build cache go.
+            systemctl is-active --quiet docker && run docker system prune -f --filter until=168h
+            command -v podman >/dev/null && run podman system prune -f --filter until=168h
         fi
 
         sec "logical volumes"
@@ -263,6 +271,18 @@ maintenance() (
         mail -s "[maint] $(hostname -s) rc=$RC$( ((NEED)) && echo ' REBOOT-NEEDED')" "$MAINT_MAIL_TO" < "$LOG"
     exit $RC
 )
+
+# Model weights are expensive to re-download and are read rarely, so atime
+# ageing would delete exactly the wrong files. Anything matching this is never
+# cleaned, however it got into MAINT_CACHE_DIRS.
+is_model_store() {
+    local d
+    d=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    case $d in
+        *gpustack*|*huggingface*|*"/hub"|*"/models"|*"/model"|*ollama*|*torch/hub*|*.cache/modelscope*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
 # volume groups and logical volumes. Read-only; snapshots show an origin.
 lvm_report() {
@@ -435,9 +455,14 @@ MAINT_JOURNAL_AGE=14d
 MAINT_JOURNAL_SIZE=1G
 MAINT_LOG_AGE_DAYS=30
 MAINT_TMP_AGE_DAYS=10          # /tmp and /var/tmp aged by atime
-MAINT_PRUNE_CONTAINERS=1
+
+# Extra directories to age by atime. Never point this at model weights: a
+# GPUStack, HuggingFace, Ollama or torch cache is read rarely and would be
+# deleted first. Such paths are skipped by name even if listed here.
+MAINT_PRUNE_CONTAINERS=1        # stopped containers, dangling layers, build cache.
+                               # Tagged images are never removed.
 MAINT_FSTRIM=1                 # fstrim -av on the LVM filesystems each run
-#MAINT_CACHE_DIRS="/home/shared/.cache/huggingface/hub /home/shared/.cache/pip"
+#MAINT_CACHE_DIRS="/home/shared/.cache/pip /home/shared/.cache/uv"
 
 # firewalld stays off. Re-asserted every run because a dnf upgrade can
 # re-enable the unit. Only sane if the nodes sit behind a perimeter firewall.
