@@ -68,7 +68,9 @@ sudo ./node-setup.sh maintenance --dry-run # verify, change nothing
 The cron job and the timer both fire **every Saturday at 08:00 Europe/Moscow**;
 `--scheduled` makes the script exit early on odd ISO weeks, so a run actually
 lands every 2 weeks. `MAINT_JITTER_SEC=1800` then spreads the cluster over the
-following half hour.
+following half hour — **only for `--scheduled` runs**. An interactive run from
+the menu never waits, and when a scheduled run does wait it logs
+`jitter: sleeping 1725s ...` first, so it can never be mistaken for a hang.
 
 | | |
 |---|---|

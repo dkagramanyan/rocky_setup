@@ -125,7 +125,14 @@ maintenance() (
     flock -n 9 || { log "another instance is running"; exit 30; }
     trap 'log interrupted; exit 20' INT TERM
 
-    ((MAINT_JITTER_SEC > 0 && DRY == 0)) && sleep $((RANDOM % MAINT_JITTER_SEC))
+    # Jitter spreads a cluster out when cron fires every node at 08:00. An
+    # interactive run must start now, so only --scheduled runs wait, and the
+    # wait is announced rather than looking like a hang.
+    if ((SCHEDULED && MAINT_JITTER_SEC > 0 && DRY == 0)); then
+        JITTER=$((RANDOM % MAINT_JITTER_SEC))
+        log "jitter: sleeping ${JITTER}s of MAINT_JITTER_SEC=$MAINT_JITTER_SEC before starting"
+        sleep "$JITTER"
+    fi
 
     log "$(hostname -f)  kernel $(uname -r)  $(cat /etc/rocky-release 2>/dev/null)"
     sec "disk before"; df -h / /boot /home 2>/dev/null
