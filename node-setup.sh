@@ -80,6 +80,7 @@ require_root() { [[ $EUID -eq 0 ]] || { log_error "run as root (sudo $0)"; retur
 : "${MAINT_EXCLUDE_PKGS:=}" "${MAINT_SECURITY_ONLY:=0}" "${MAINT_AUTOREMOVE:=0}"
 : "${MAINT_JOURNAL_AGE:=14d}" "${MAINT_JOURNAL_SIZE:=1G}" "${MAINT_LOG_AGE_DAYS:=30}"
 : "${MAINT_TMP_AGE_DAYS:=10}" "${MAINT_CACHE_DIRS:=}" "${MAINT_PRUNE_CONTAINERS:=1}"
+: "${MAINT_FSTRIM:=1}"
 : "${MAINT_DISABLE_FIREWALL:=1}" "${MAINT_SKIP_IF_BUSY:=1}"
 : "${MAINT_REBOOT_MODE:=never}" "${MAINT_REBOOT_DELAY_MIN:=5}" "${MAINT_MAIL_TO:=}"
 
@@ -130,7 +131,11 @@ maintenance() (
     sec "disk before"; df -h / /boot /home 2>/dev/null
 
     if ((FORCE == 0 && MAINT_SKIP_IF_BUSY == 1)) && node_busy; then
-        log "GPU or Slurm work in progress, skipping"; exit 10
+        log "GPU or Slurm work in progress, skipping"
+        busy_reason | sed 's/^/  /'
+        log "run with --force (menu: 'Force maintenance') to clean anyway;"
+        log "with MAINT_REBOOT_MODE=$MAINT_REBOOT_MODE a forced run will not reboot the node"
+        exit 10
     fi
 
     # --- kernels and /boot ---------------------------------------------------
@@ -195,6 +200,15 @@ maintenance() (
             systemctl is-active --quiet docker && run docker system prune -af --filter until=168h
             command -v podman >/dev/null && run podman system prune -af --filter until=168h
         fi
+
+        sec "logical volumes"
+        lvm_report
+        # fstrim frees nothing in df; it tells the SSD which blocks the
+        # filesystems stopped using, which is what keeps a thin pool honest.
+        if ((MAINT_FSTRIM)); then
+            if command -v fstrim >/dev/null; then run fstrim -av
+            else log "fstrim not installed (dnf install util-linux), skipping trim"; fi
+        fi
     fi
 
     # --- firewall ------------------------------------------------------------
@@ -242,6 +256,31 @@ maintenance() (
         mail -s "[maint] $(hostname -s) rc=$RC$( ((NEED)) && echo ' REBOOT-NEEDED')" "$MAINT_MAIL_TO" < "$LOG"
     exit $RC
 )
+
+# volume groups and logical volumes. Read-only; snapshots show an origin.
+lvm_report() {
+    command -v vgs >/dev/null || { echo "  no LVM tools installed"; return 0; }
+    # --separator keeps empty columns, so origin cannot be confused with data_percent
+    vgs --noheadings --separator '|' --units g -o vg_name,vg_size,vg_free 2>/dev/null \
+        | sed -e 's/^ *//' -e 's/ *$//' | awk -F'|' '{printf "  vg %-8s size %-10s free %s\n", $1, $2, $3}'
+    lvs --noheadings --separator '|' --units g -o lv_name,vg_name,lv_size,origin,data_percent 2>/dev/null \
+        | sed -e 's/^ *//' -e 's/ *$//' | awk -F'|' '{
+              extra = ($4 != "") ? "  snapshot of " $4 : ""
+              if ($5 != "") extra = extra "  data " $5 "%"
+              printf "  lv %-8s vg %-6s size %-10s%s\n", $1, $2, $3, extra
+          }'
+    return 0
+}
+
+# what exactly is holding the node, printed when the guard trips
+busy_reason() {
+    local gpu slurm
+    gpu=$(nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>/dev/null)
+    [[ -n $gpu ]] && { echo "GPU compute processes (pid, name, memory):"; sed 's/^/  /' <<<"$gpu"; }
+    slurm=$(squeue -h -w "$(hostname -s)" -t RUNNING -o '%i %u %j' 2>/dev/null)
+    [[ -n $slurm ]] && { echo "Slurm jobs on this host (id, user, name):"; sed 's/^/  /' <<<"$slurm"; }
+    return 0
+}
 
 node_busy() {
     nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -q . && return 0
@@ -390,6 +429,7 @@ MAINT_JOURNAL_SIZE=1G
 MAINT_LOG_AGE_DAYS=30
 MAINT_TMP_AGE_DAYS=10          # /tmp and /var/tmp aged by atime
 MAINT_PRUNE_CONTAINERS=1
+MAINT_FSTRIM=1                 # fstrim -av on the LVM filesystems each run
 #MAINT_CACHE_DIRS="/home/shared/.cache/huggingface/hub /home/shared/.cache/pip"
 
 # firewalld stays off. Re-asserted every run because a dnf upgrade can
@@ -525,7 +565,7 @@ do_status() {
     echo
     printf '%-22s %s\n' "host" "$(hostname -f)  $(cat /etc/rocky-release 2>/dev/null)"
     printf '%-22s %s\n' "kernel" "$(uname -r)"
-    printf '%-22s %s\n' "script" "$([[ -x $BIN ]] && echo "$BIN" || echo 'not installed')"
+    printf '%-22s %s\n' "script" "$([[ -x $BIN ]] && echo "$BIN" || echo 'NOT INSTALLED')"
     printf '%-22s %s\n' "config" "$([[ -e $CONF ]] && echo "$CONF" || echo 'not installed')"
     printf '%-22s %s\n' "biweekly" "MAINT_BIWEEKLY=$MAINT_BIWEEKLY  (ISO week now: $((10#$(date +%V))))"
 
@@ -538,7 +578,18 @@ do_status() {
         printf '%-22s %s\n' "schedule" "not installed"
     fi
 
+    if [[ ( -e $CRON || -e $TIMER ) && ! -x $BIN ]]; then
+        log_warning "a schedule is installed but $BIN is missing — the scheduled run does nothing."
+        log_warning "fix it with: sudo ./node-setup.sh install"
+    fi
+
+    if node_busy; then
+        echo; log_warning "node is busy, plain maintenance will exit 10:"
+        busy_reason | sed 's/^/  /'
+    fi
+
     echo; df -h / /boot /home 2>/dev/null
+    echo; lvm_report
     if command -v nvidia-smi >/dev/null; then
         echo; nvidia-smi --query-gpu=index,name,driver_version,memory.used,memory.total,temperature.gpu \
             --format=csv 2>&1 | sed 's/^/  /'
@@ -560,24 +611,27 @@ menu() {
         echo -e "${BLUE}─────────────────────────────────────────────${NC}"
         echo "1. Bootstrap this node (driver, CUDA, docker)"
         echo "2. Run maintenance now (clean + update)"
-        echo "3. Dry run (print, change nothing)"
-        echo "4. Install schedule — cron"
-        echo "5. Install schedule — systemd timer"
-        echo "6. Remove schedule"
-        echo "7. Status"
+        echo "3. Force maintenance (ignore the busy guard)"
+        echo "4. Dry run (print, change nothing)"
+        echo "5. Install schedule — cron"
+        echo "6. Install schedule — systemd timer"
+        echo "7. Remove schedule"
+        echo "8. Status"
         echo -e "${RED}0. Exit${NC}"
         echo -e "${BLUE}─────────────────────────────────────────────${NC}"
-        read -r -p "Choose an action [0-7]: " choice
+        read -r -p "Choose an action [0-8]: " choice || break
         case $choice in
             1) echo -e "${YELLOW}→  Bootstrap${NC}";        bootstrap ;;
             2) echo -e "${YELLOW}→  Maintenance${NC}";      maintenance; log_info "exit $?" ;;
-            3) echo -e "${YELLOW}→  Dry run${NC}";          maintenance --dry-run; log_info "exit $?" ;;
-            4) echo -e "${YELLOW}→  Install (cron)${NC}";   do_install ;;
-            5) echo -e "${YELLOW}→  Install (timer)${NC}";  do_install --timer ;;
-            6) echo -e "${YELLOW}→  Remove schedule${NC}";  do_uninstall ;;
-            7) do_status ;;
+            3) echo -e "${YELLOW}→  Forced maintenance${NC}"; maintenance --force; log_info "exit $?" ;;
+            4) echo -e "${YELLOW}→  Dry run${NC}";          maintenance --dry-run; log_info "exit $?" ;;
+            5) echo -e "${YELLOW}→  Install (cron)${NC}";   do_install ;;
+            6) echo -e "${YELLOW}→  Install (timer)${NC}";  do_install --timer ;;
+            7) echo -e "${YELLOW}→  Remove schedule${NC}";  do_uninstall ;;
+            8) do_status ;;
             0) echo -e "${GREEN}Bye.${NC}"; break ;;
-            *) log_error "invalid choice, enter 0-7" ;;
+            "") ;;
+            *) log_error "invalid choice, enter 0-8" ;;
         esac
     done
 }

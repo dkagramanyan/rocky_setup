@@ -14,6 +14,9 @@ current on a schedule, and gives you a menu when you run it with no arguments.
   room for the new initramfs, `dnf upgrade` with your excludes, journal vacuum,
   rotated logs, core dumps, `/tmp` and `/var/tmp` by atime, pip/uv/npm caches,
   `docker`/`podman` prune, GPU and `dkms` report, reboot policy.
+- **Logical volumes**: reports the volume groups, logical volumes, snapshots
+  and free extents, and runs `fstrim -av` so the SSD learns which blocks the
+  filesystems no longer use. It never resizes or removes a volume.
 - **Guards**: `flock` against overlapping runs, a busy check on `nvidia-smi`
   compute processes and `squeue`, a `/boot` free-space floor, and per-node
   start jitter so a cluster does not hit the mirrors at once.
@@ -88,11 +91,32 @@ The gap is exactly 14 days except once across a 53-week year boundary.
 6. `dnf upgrade` with the configured excludes, `dnf clean all`.
 7. Journal vacuum, rotated logs, core dumps, `/tmp` and `/var/tmp` by atime,
    pip/uv/npm caches, `docker`/`podman` prune.
-8. Disables and masks `firewalld` when `MAINT_DISABLE_FIREWALL=1`.
-9. Reports GPU state, `dkms status`, and the `nvidia` module license.
-10. `needs-restarting -r`, then acts on `MAINT_REBOOT_MODE`.
+8. Logs `vgs`/`lvs` and runs `fstrim -av` when `MAINT_FSTRIM=1`.
+9. Disables and masks `firewalld` when `MAINT_DISABLE_FIREWALL=1`.
+10. Reports GPU state, `dkms status`, and the `nvidia` module license.
+11. `needs-restarting -r`, then acts on `MAINT_REBOOT_MODE`.
 
 Log: `/var/log/node-maintenance/latest.log`.
+
+## When the node is busy
+
+A run exits 10 without touching anything if `nvidia-smi` reports compute
+processes or `squeue` shows jobs on this host. That is the guard doing its job,
+not a failure — the log then names the processes holding the node:
+
+```
+GPU or Slurm work in progress, skipping
+  GPU compute processes (pid, name, memory):
+    3412, python3, 1646 MiB
+```
+
+To clean anyway, use `--force` (menu entry 3). With the default
+`MAINT_REBOOT_MODE=never` a forced run will not reboot the node, and kernel
+pruning — the part that rescues a full `/boot` — is safe while jobs run.
+
+`status` prints the same list up front, and warns if a schedule is installed
+while `/usr/local/sbin/node-setup.sh` is missing, which means the cron job or
+timer is firing into nothing.
 
 ## Commands and exit codes
 
@@ -107,6 +131,10 @@ node-setup.sh status                what is installed, when it next runs
 
 Maintenance options: `--clean-only`, `--update-only`, `--dry-run`, `--force`
 (ignore the busy guard), `--scheduled` (honour `MAINT_BIWEEKLY`).
+
+Cleanup knobs in `/etc/sysconfig/node-maintenance`: `MAINT_JOURNAL_AGE`,
+`MAINT_JOURNAL_SIZE`, `MAINT_LOG_AGE_DAYS`, `MAINT_TMP_AGE_DAYS`,
+`MAINT_CACHE_DIRS`, `MAINT_PRUNE_CONTAINERS`, `MAINT_FSTRIM`.
 
 | Code | Meaning |
 |---|---|
@@ -177,14 +205,15 @@ Schedule: every 2 weeks, Saturday 08:00 MSK (even ISO weeks)
 ─────────────────────────────────────────────
 1. Bootstrap this node (driver, CUDA, docker)
 2. Run maintenance now (clean + update)
-3. Dry run (print, change nothing)
-4. Install schedule — cron
-5. Install schedule — systemd timer
-6. Remove schedule
-7. Status
+3. Force maintenance (ignore the busy guard)
+4. Dry run (print, change nothing)
+5. Install schedule — cron
+6. Install schedule — systemd timer
+7. Remove schedule
+8. Status
 0. Exit
 ─────────────────────────────────────────────
-Choose an action [0-7]:
+Choose an action [0-8]:
 ```
 
 ## Upgrading from v1
