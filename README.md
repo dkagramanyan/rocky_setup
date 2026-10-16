@@ -142,10 +142,150 @@ pruning — the part that rescues a full `/boot` — is safe while jobs run.
 while `/usr/local/sbin/node-setup.sh` is missing, which means the cron job or
 timer is firing into nothing.
 
+## Check and update a GPU node (`--check`, `--update`)
+
+Run these on each node, from the repository clone, with sudo. One node at a
+time: finish a node (including its watch window) before starting the next.
+
+```bash
+sudo ./node-setup.sh --update             # update everything, press Enter at each question
+sudo ./node-setup.sh --update             # again after the reboot: verify, start GPUStack, watch
+sudo ./node-setup.sh --check              # read-only report, exit 1 on any problem
+sudo ./node-setup.sh --update --dry-run   # print every change, make none
+```
+
+By default `--update` removes **every** version lock and updates everything.
+To keep a lock, for example the NVIDIA driver, type its number at the lock
+question. Every question defaults to Yes, so Enter goes ahead.
+
+A crash dump that is new stops the update. New means newer than the last
+`--check`, or from the last 7 days if there has been no check yet. Every run
+writes `./reports/<time>-<mode>-<host>.log`. `--check` also writes
+`./reports/summary-<host>.env`.
+
+Run `--update` inside `tmux` or `screen` when you are on SSH. A dropped
+connection kills `dnf` in the middle of a kernel or DKMS install.
+
+### What `--check` reports
+
+The detail block, then one table row per node:
+
+```
+NODE     UP      KERNEL    NEWEST    BIOS   DRIVER     FLAV NVIDIA-OPEN          KMOD-DKMS            DKMS  IRQBALANCE       KDUMP  DUMPS tot/new/newest  TIMER  WORKER          LOCKS
+cn-002   14d6h   687.51.1  687.51.1  1403   610.57.04  open 610.57.04>615.71.09  610.57.04>615.71.09  ok    inactive/masked  armed  208/0/2026-10-04      201    running/always  15/22 behind
+```
+
+It covers: kernel running and newest installed, BIOS, loaded driver and
+module license, installed and newest available `nvidia-open` and
+`kmod-nvidia-open-dkms`, and `dkms status` for every installed kernel. It also
+shows irqbalance (reported only, never changed), kdump, and the crash dumps in
+`/var/crash` and `/var/crash/logs`: total, new since the last check, newest,
+how many match the timer signature, and which CPUs crashed. Finally it shows
+what `crash-cleanup.service` deletes, whether
+`/usr/local/sbin/kernel-timer-watch` is enabled, the `gpustack-worker` state
+and restart policy, and whether `90-crashdebug.conf` is in place.
+
+The table also lists every other `summary-*.env` found in `./reports`. Copy
+the other nodes' files there to get a fleet view, and the loaded driver is
+compared across them.
+
+Exit 1 if this node has any of these:
+
+- a lock behind an available update
+- a driver different from the newest one in the fleet
+- a kernel without a built nvidia module
+- a new crash dump, or a new timer-signature dump
+- kdump not armed
+- a failed `repoquery`
+
+The counts of old dumps are reported, but they do not fail the check.
+
+### Version locks
+
+`dnf versionlock` makes `dnf upgrade` skip a package without saying so. That
+is how cn-002 stayed on the crashing 610.57.04 for two months. Each lock is
+compared with the newest version in the enabled repos, with the lock
+disabled:
+
+| Status | Meaning |
+|---|---|
+| `LOCKED-BEHIND` | a newer version is available, the lock is holding it back |
+| `LOCKED-CURRENT` | the locked version is the newest available |
+| `LOCKED-UNKNOWN` | `repoquery` failed, nothing can be said |
+
+The locks are grouped into NVIDIA driver, CUDA toolkit and other. The date
+comes from the `# Added lock on …` comment in
+`/etc/dnf/plugins/versionlock.list`:
+
+```
+!! cn-002: 15 packages version-locked behind available updates
+   NVIDIA driver   610.57.04 -> 615.71.09 available   (locked since 2026-08-17)   [11 packages]
+   CUDA toolkit    13.3.0 -> 13.3.1 available   (locked since 2026-08-17)   [4 packages]
+   other           none
+```
+
+The scheduled `maintenance` run prints the same block and exits 20 when locks
+hold something back, so the drift shows up in its log and mail.
+
+### What `--update` does, in order
+
+1. Runs the checks above. If a crash dump appeared since the last check, it
+   stops. A crashing node is not updated blindly.
+2. If the node has locks, it lists them by group and removes them all
+   unless you pick some to keep:
+   ```
+   These version locks will be removed so everything updates:
+     1) NVIDIA driver  610.57.04 -> 615.71.09 available   (11 locked, 11 behind, since 2026-08-17)
+     2) CUDA toolkit   13.3.0 -> 13.3.1 available   (4 locked, 4 behind, since 2026-08-17)
+   Keep any of them locked? Enter = none, or numbers (e.g. 1):
+   ```
+   `versionlock.list` is first copied to `versionlock.list.bak-<time>`.
+   Then `dnf versionlock clear` runs, or `dnf versionlock delete` for the
+   groups you did not keep. Next it shows the full transaction with the
+   NVIDIA and kernel lines highlighted and asks `Proceed? [Y/n]`. Answering
+   `n` puts the backup back, so the locks are exactly as they were.
+3. Stops `gpustack-worker`, then the model containers (`*-run-*`, `*-pause`),
+   and records what was running.
+4. Sets `gpustack-worker` to `--restart=no` and records the old policy.
+   Asks once whether to add `kernel.ftrace_dump_on_oops = 1` in
+   `/etc/sysctl.d/90-crashdebug.conf`, if it is not there yet.
+5. `dnf -y --refresh upgrade`
+6. `dnf -y --setopt=installonly_limit=2 remove --oldinstallonly`
+7. (Locks you chose to keep stay as they are. Nothing is re-locked.)
+8. **Pre-reboot gate** for the newest kernel: `dkms status -k` says
+   `installed`, `extra/nvidia.ko.xz` exists, its version is the installed
+   driver, and `grubby --default-kernel` points at it. If anything fails, it
+   does not reboot and leaves the node drained.
+9. If `needs-restarting -r` or the driver change requires it, asks
+   `Reboot <node> now? [Y/n]`.
+
+The state of the update is kept in `/var/lib/node-setup/update.state`. While
+that file exists the node stays drained with `restart=no`, and the next
+`sudo ./node-setup.sh --update` resumes here:
+
+10. Verifies: the running kernel is the newest one, `nvidia-smi` reports the
+    installed driver, irqbalance is unchanged, kdump is armed, and there is no
+    new crash dump.
+11. Starts `gpustack-worker` and waits up to 10 min for the model containers.
+12. Watches for 15 min, then checks for new crash dumps and kdump again.
+    Only then does it restore the old restart policy. A crash in the window
+    therefore cannot turn into a boot loop. If the node rebooted during the
+    window, the next `--update` says so and leaves the policy at `no`.
+
+Any failed step stops the update with the node drained. Fix the cause, then
+run `--update` again. To abandon an unfinished update, remove
+`/var/lib/node-setup/update.state` and restore the restart policy by hand
+(`docker update --restart=<policy> gpustack-worker`).
+
+Never touched: crash dumps, irqbalance, BIOS and firmware, `crash-cleanup.*`,
+`kernel-timer-watch`.
+
 ## Commands and exit codes
 
 ```
 node-setup.sh                       interactive menu
+node-setup.sh --check               read-only report of this node (exit 1 on problems)
+node-setup.sh --update [--dry-run]  guarded update; run again after the reboot
 node-setup.sh bootstrap [stages]    base repos nouveau driver cuda toolkit docker firewall lock
 node-setup.sh maintenance           clean + update now
 node-setup.sh install [--timer]     deploy the script, config and schedule

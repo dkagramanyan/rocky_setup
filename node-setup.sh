@@ -10,6 +10,12 @@
 #>  install             deploy this script and the schedule (default: cron)
 #>  uninstall           remove the schedule, keep script, config and logs
 #>  status              what is installed, when it next runs
+#>  --check             read-only report of this node: version locks, driver,
+#>                      DKMS, kdump, crash dumps, GPUStack. Exit 1 on any problem
+#>  --update [--dry-run]
+#>                      guarded interactive update of this node: lock menu,
+#>                      drain, upgrade, pre-reboot gate, reboot. Run it again
+#>                      after the reboot to verify, start GPUStack and watch
 #>
 #>Maintenance options
 #>  --clean-only        no package upgrade
@@ -34,6 +40,15 @@ CRON=/etc/cron.d/node-maintenance
 UNIT=/etc/systemd/system/node-maintenance.service
 TIMER=/etc/systemd/system/node-maintenance.timer
 LOGROTATE=/etc/logrotate.d/node-maintenance
+
+# --check / --update
+REPORT_DIR=./reports                       # run logs and summary-<host>.env
+STATE_DIR=/var/lib/node-setup              # last-check time, unfinished update
+CRASH_DIR=/var/crash
+VLOCK=/etc/dnf/plugins/versionlock.list
+CRASHDEBUG_CONF=/etc/sysctl.d/90-crashdebug.conf
+TIMER_SIG='__run_timers|enqueue_timer|timer.c:1686|vector_cleanup'
+WATCH_MIN=15
 
 # schedule: every second ISO week, Saturday 08:00 Europe/Moscow (GMT+3).
 # The "every second week" half is MAINT_BIWEEKLY inside the script, so cron and
@@ -175,6 +190,17 @@ maintenance() (
 
     # --- upgrade -------------------------------------------------------------
     if ((UPDATE)); then
+        # A lock makes dnf skip a package without a word. Say so in the log.
+        sec "version locks"
+        LOCKS=$(locks_now) || warn "repoquery failed, cannot tell whether the locks hold anything back"
+        if [[ -z $LOCKS ]]; then
+            log "no version locks"
+        else
+            lock_detail <<<"$LOCKS"
+            lock_block "$(hostname -s)" <<<"$LOCKS" \
+                && warn "version locks hold packages back, this upgrade skips them (decide with: sudo $BIN --update)"
+        fi
+
         sec "upgrade"
         ARGS=(--refresh); for p in $MAINT_EXCLUDE_PKGS; do ARGS+=("--exclude=$p"); done
         ((MAINT_SECURITY_ONLY)) && ARGS+=(--security)
@@ -257,8 +283,8 @@ maintenance() (
         log "reboot required (mode=$MAINT_REBOOT_MODE)"
         case $MAINT_REBOOT_MODE in
             if-needed) run shutdown -r "+$MAINT_REBOOT_DELAY_MIN" "maintenance reboot" ;;
-            if-idle)   node_busy && log "busy, not rebooting" \
-                            || run shutdown -r "+$MAINT_REBOOT_DELAY_MIN" "maintenance reboot" ;;
+            if-idle)   if node_busy; then log "busy, not rebooting"
+                       else run shutdown -r "+$MAINT_REBOOT_DELAY_MIN" "maintenance reboot"; fi ;;
             *)         log "not rebooting, do it manually" ;;
         esac
     else
@@ -300,6 +326,7 @@ lvm_report() {
 }
 
 # what exactly is holding the node, printed when the guard trips
+# shellcheck disable=SC2001
 busy_reason() {
     local gpu slurm
     gpu=$(nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>/dev/null)
@@ -398,6 +425,7 @@ EOF
                 systemctl start containerd docker
                 log_warning "old data left in /var/lib/docker, remove it once 'docker images' looks right"
             fi
+            # shellcheck source=/dev/null
             distribution=$(. /etc/os-release; echo "$ID$VERSION_ID")
             curl -fsSL "https://nvidia.github.io/nvidia-container-toolkit/$distribution/nvidia-container-toolkit.repo" \
                 -o /etc/yum.repos.d/nvidia-container-toolkit.repo
@@ -424,6 +452,553 @@ EOF
 
     say "done"
 )
+
+# =============================================================================
+# --check / --update — run on each node with sudo. Version locks are made
+# visible, the update drains GPUStack, gates the reboot on a built nvidia
+# module and keeps gpustack-worker from auto-starting until the node has
+# survived a watch window. Background: cn-002 crash-looped on a versionlocked
+# 610.57.04 driver that the routine dnf upgrade skipped for two months.
+# =============================================================================
+
+# key=value summary of one node, written by probe, read by everything after it
+kv()  { printf '%s=%s\n' "$1" "$2" >> "$KV"; }
+kvg() { sed -n "s/^$2=//p" "$1" 2>/dev/null | tail -n 1; }      # kvg file key
+
+evr_ver() {     # 3:615.71.09-1.el9 -> 615.71.09
+    [[ -z $1 || $1 == - ]] && { echo -; return 0; }
+    local v=${1#*:}; echo "${v%-*}"
+}
+evr_newer() {   # true if EVR $1 is newer than EVR $2
+    local a=$1 b=$2
+    [[ $a == *:* ]] || a="0:$a"
+    [[ $b == *:* ]] || b="0:$b"
+    [[ $a != "$b" && $(printf '%s\n%s\n' "$a" "$b" | sort -V | tail -n 1) == "$a" ]]
+}
+rpm_evr() {     # installed EVR of a package, - when absent
+    rpm -q --qf '%{EVR}\n' "$1" 2>/dev/null | grep -v 'not installed' | sort -V | tail -n 1 | grep . || echo -
+}
+kernels_installed() { rpm -q kernel-core --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' 2>/dev/null | sort -V; }
+boot_id() { cat /proc/sys/kernel/random/boot_id; }
+irq_state() { echo "$(systemctl is-active irqbalance 2>/dev/null)/$(systemctl is-enabled irqbalance 2>/dev/null || true)"; }
+unit_state() { echo "$(systemctl is-enabled "$1" 2>/dev/null || true)/$(systemctl is-active "$1" 2>/dev/null)"; }
+
+# --- version locks -----------------------------------------------------------
+lock_group() {
+    case $1 in
+        nvidia-container*|libnvidia-container*)             echo other ;;
+        nvidia-*|kmod-nvidia*|libnvidia-*|xorg-x11-nvidia*) echo nvidia ;;
+        cuda*|libcu*|libnpp*|libnv*|nsight*|gds-tools*)     echo cuda ;;
+        *)                                                  echo other ;;
+    esac
+}
+lock_entries() { dnf -q versionlock list 2>/dev/null | sed 's/[[:space:]]*$//' | grep -vE '^(#|!|$)'; }
+lock_spec() { local s=${1%.\*}; s=${s%.x86_64}; s=${s%.noarch}; echo "${s%.i686}"; }
+lock_name() { local s; s=$(lock_spec "$1"); echo "${s%-*-*}"; }
+lock_evr()  { local s n; s=$(lock_spec "$1"); n=$(lock_name "$1"); echo "${s#"$n"-}"; }
+# entry|comment: the comment dnf writes above each entry ("Added lock on <date>")
+lock_dates() {
+    awk '/^#/ { c = $0; sub(/^#[[:space:]]*/, "", c); gsub(/\|/, "/", c); next } NF { print $1 "|" c }' "$VLOCK" 2>/dev/null
+}
+# name|evr of the newest version in the enabled repos, the lock ignored
+repo_newest() {
+    dnf -q --refresh --disableplugin=versionlock repoquery --latest-limit=1 \
+        --qf '%{name}|%{evr}\n' "$@" | sort -t'|' -k1,1 -k2,2V
+}
+newest_of() { awk -F'|' -v n="$1" '$1 == n { v = $2 } END { print (v == "" ? "-" : v) }' <<<"$2"; }
+
+# One line per lock: status|group|name|locked-evr|newest-evr|since|comment.
+# BEHIND: the repos carry a newer version than the lock allows.
+# CURRENT: the locked version is the newest. UNKNOWN: repoquery failed.
+lock_scan() {   # $1 entries, $2 repo_newest output, $3 lock_dates output, $4 1 if repoquery worked
+    local e name evr newest st c since
+    while read -r e; do
+        [[ -n $e ]] || continue
+        name=$(lock_name "$e"); evr=$(lock_evr "$e"); newest=$(newest_of "$name" "$2")
+        if (($4 == 0)); then st=UNKNOWN
+        elif [[ $newest != - ]] && evr_newer "$newest" "$evr"; then st=BEHIND
+        else st=CURRENT; fi
+        c=$(awk -F'|' -v e="$e" '$1 == e { print $2; exit }' <<<"$3")
+        if [[ $c =~ ^Added\ lock\ on\ (.*)$ ]]; then
+            since=$(date -d "${BASH_REMATCH[1]}" +%F 2>/dev/null || echo "${BASH_REMATCH[1]}"); c=
+        elif [[ $c =~ ([0-9]{4}-[0-9]{2}-[0-9]{2}) ]]; then since=${BASH_REMATCH[1]}
+        else since='?'; fi
+        printf '%s|%s|%s|%s|%s|%s|%s\n' "$st" "$(lock_group "$name")" "$name" "$evr" "$newest" "$since" "$c"
+    done <<<"$1"
+}
+locks_now() {   # lock_scan for this node; fails if repoquery failed
+    local e entries avail ok=1 names=()
+    entries=$(lock_entries)
+    [[ -n $entries ]] || return 0
+    while read -r e; do names+=("$(lock_name "$e")"); done <<<"$entries"
+    avail=$(repo_newest "${names[@]}") || ok=0
+    lock_scan "$entries" "$avail" "$(lock_dates)" "$ok"
+    ((ok))
+}
+lock_detail() {
+    awk -F'|' '{ printf "    %-14s %-6s %-34s %-22s %-22s since %s%s\n", "LOCKED-" $1, $2, $3, $4,
+                 ($5 == "-" ? "(not in repos)" : $5), $6, ($7 == "" ? "" : "  # " $7) }'
+}
+# The warning block. Succeeds only if something is held back.
+lock_block() {   # stdin: lock_scan lines, $1 node name
+    awk -F'|' -v node="$1" '
+        function ver(e) { sub(/^[0-9]+:/, "", e); sub(/-[^-]*$/, "", e); return e }
+        $1 == "BEHIND" {
+            n++; cnt[$2]++
+            rep = ($3 ~ /^(nvidia-open|kmod-nvidia-open-dkms|cuda-toolkit)/)
+            if (!($2 in from) || (rep && !isrep[$2])) {
+                from[$2] = ver($4); to[$2] = ver($5); since[$2] = $6; isrep[$2] = rep
+            }
+        }
+        END {
+            if (!n) exit 1
+            printf "!! %s: %d packages version-locked behind available updates\n", node, n
+            lbl["nvidia"] = "NVIDIA driver"; lbl["cuda"] = "CUDA toolkit"; lbl["other"] = "other"
+            split("nvidia cuda other", order, " ")
+            for (i = 1; i <= 3; i++) {
+                g = order[i]
+                if (!(g in from)) { printf "   %-15s none\n", lbl[g]; continue }
+                printf "   %-15s %s -> %s available   (locked since %s)%s\n", lbl[g], from[g], to[g], since[g],
+                       (cnt[g] > 1 ? "   [" cnt[g] " packages]" : "")
+            }
+        }'
+}
+
+# group|label|summary per lock group, for the update menu
+lock_groups() {
+    awk -F'|' '
+        function ver(e) { sub(/^[0-9]+:/, "", e); sub(/-[^-]*$/, "", e); return e }
+        { n[$2]++; if (!($2 in since)) since[$2] = $6
+          if ($1 == "BEHIND") { b[$2]++; rep = ($3 ~ /^(nvidia-open|kmod-nvidia-open-dkms|cuda-toolkit)/)
+              if (!($2 in from) || (rep && !isrep[$2])) { from[$2] = ver($4); to[$2] = ver($5); isrep[$2] = rep } } }
+        END {
+            lbl["nvidia"] = "NVIDIA driver"; lbl["cuda"] = "CUDA toolkit"; lbl["other"] = "other"
+            split("nvidia cuda other", order, " ")
+            for (i = 1; i <= 3; i++) {
+                g = order[i]; if (!n[g]) continue
+                if (b[g]) printf "%s|%s|%s -> %s available   (%d locked, %d behind, since %s)\n", g, lbl[g], from[g], to[g], n[g], b[g], since[g]
+                else      printf "%s|%s|%d locked, already newest\n", g, lbl[g], n[g]
+            }
+        }'
+}
+
+# --- crash dumps -------------------------------------------------------------
+# A dump is a kdump directory in /var/crash or a file in /var/crash/logs.
+dump_units() {   # "mtime path"
+    [[ -d $CRASH_DIR ]] || return 0
+    {
+        find "$CRASH_DIR" -mindepth 1 -maxdepth 1 -type d ! -name logs -printf '%T@ %p\n'
+        [[ ! -d $CRASH_DIR/logs ]] || find "$CRASH_DIR/logs" -type f -printf '%T@ %p\n'
+    } 2>/dev/null | sed 's/\.[0-9]*//'
+}
+dumps_since() { dump_units | awk -v s="$1" '$1 > s' | grep -c . || true; }
+# -I skips binary files, so the vmcores are not read
+timer_units() {   # dumps with a text file matching the timer signature
+    [[ -d $CRASH_DIR ]] || return 0
+    grep -rlIE "$TIMER_SIG" --exclude=vmcore --exclude=vmcore.flat "$CRASH_DIR" 2>/dev/null \
+        | awk -v root="$CRASH_DIR" '{ rel = substr($0, length(root) + 2)
+              if (rel ~ /^logs\//) print; else { split(rel, p, "/"); print root "/" p[1] } }' | sort -u
+}
+cpu_hist() {     # CPU12:190 CPU3:4
+    [[ -d $CRASH_DIR ]] || return 0
+    grep -rhoIE 'CPU: [0-9]+ PID: [0-9]+ (at|Comm)' --exclude=vmcore --exclude=vmcore.flat "$CRASH_DIR" 2>/dev/null \
+        | awk '{ print $2 }' | sort | uniq -c | sort -rn \
+        | awk '{ printf "%sCPU%s:%s", (NR > 1 ? " " : ""), $2, $1 } END { print "" }'
+}
+# what crash-cleanup.service runs, and the lines in its scripts that delete
+cleanup_info() {
+    local f
+    systemctl cat crash-cleanup.service >/dev/null 2>&1 || { echo "no crash-cleanup.service"; return 0; }
+    echo "timer $(unit_state crash-cleanup.timer), next run $(systemctl show -p NextElapseUSecRealtime --value crash-cleanup.timer 2>/dev/null)"
+    systemctl cat crash-cleanup.service crash-cleanup.timer 2>/dev/null | grep -E '^(Exec|OnCalendar|OnBootSec|OnUnitActiveSec)'
+    for f in $(systemctl show -p ExecStart --value crash-cleanup.service | tr -s ' ;' '\n' \
+               | sed -E 's/^(path|argv\[\])=//' | grep '^/' | sort -u); do
+        [[ -f $f ]] || continue
+        grep -nIE '(^|[^[:alnum:]_-])(rm|shred|truncate|unlink)([^[:alnum:]_-]|$)|-delete|find ' "$f" | sed "s|^|deletes? $f:|"
+    done
+    return 0
+}
+timer_watch_info() {
+    local u w=/usr/local/sbin/kernel-timer-watch found=0
+    [[ -e $w ]] || { echo "$w not present"; return 0; }
+    for u in $(grep -lrs "$w" /etc/systemd/system --include='*.service' --include='*.timer' | xargs -r -n1 basename | sort -u); do
+        echo "$u $(unit_state "$u")"; found=1
+        [[ $u == *.service && -e /etc/systemd/system/${u%.service}.timer ]] \
+            && echo "${u%.service}.timer $(unit_state "${u%.service}.timer")"
+    done
+    grep -ls "$w" /etc/crontab /etc/cron.d/* /var/spool/cron/* 2>/dev/null | sed 's/^/cron: /' && found=1
+    ((found)) || echo "present, but no systemd unit or cron entry runs it"
+    return 0
+}
+
+# --- GPUStack ----------------------------------------------------------------
+worker_state() {   # status|restart-policy of the gpustack-worker container
+    docker inspect -f '{{.State.Status}}|{{.HostConfig.RestartPolicy.Name}}:{{.HostConfig.RestartPolicy.MaximumRetryCount}}' \
+        gpustack-worker 2>/dev/null | sed -E 's/:0$//; s/\|:?$/|no/' || echo 'absent|-'
+}
+model_containers() { docker ps --format '{{.Names}}' 2>/dev/null | grep -E -- '-run-|-pause$'; }
+
+# --- probe and report --------------------------------------------------------
+probe() {   # $1 crash baseline (epoch, 0 = none yet), $2 summary file to write
+    local since=$1 k st ok l w wp locks avail repo_ok=1 units timer newest
+    KV=$2; : > "$KV"
+    kv host "$(hostname -s)"; kv fqdn "$(hostname -f)"
+    kv now "$(date +%s)"; kv date "$(date '+%F %T')"; kv boot_id "$(boot_id)"
+    kv uptime_s "$(cut -d. -f1 /proc/uptime)"
+    kv kernel_run "$(uname -r)"; kv kernel_new "$(kernels_installed | tail -n 1)"
+    kv bios "$(dmidecode -s bios-version 2>/dev/null || cat /sys/class/dmi/id/bios_version 2>/dev/null)"
+    kv driver "$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n 1)"
+    kv license "$(modinfo -F license nvidia 2>/dev/null)"
+
+    locks=$(locks_now) || repo_ok=0
+    avail=$(repo_newest nvidia-open kmod-nvidia-open-dkms) || repo_ok=0
+    kv repo_ok "$repo_ok"
+    kv nvopen_inst "$(rpm_evr nvidia-open)";           kv nvopen_avail "$(newest_of nvidia-open "$avail")"
+    kv kmod_inst "$(rpm_evr kmod-nvidia-open-dkms)";   kv kmod_avail "$(newest_of kmod-nvidia-open-dkms "$avail")"
+    while read -r l; do [[ -z $l ]] || kv lock "$l"; done <<<"$locks"
+
+    while read -r k; do
+        [[ -n $k ]] || continue
+        st=$(dkms status -k "$k" 2>/dev/null | grep -E '^nvidia[/,]' | head -n 1)
+        ok=MISSING
+        [[ $st == *": installed"* && -e /lib/modules/$k/extra/nvidia.ko.xz ]] && ok=ok
+        kv dkms "$k|$ok|${st:-no nvidia dkms entry}"
+    done < <(kernels_installed)
+
+    kv irq "$(irq_state)"
+    kv kdump_status "$(kdumpctl status 2>&1 | tail -n 1)"
+    kv kdump_loaded "$(cat /sys/kernel/kexec_crash_loaded 2>/dev/null || echo 0)"
+
+    units=$(dump_units); timer=$(timer_units)
+    kv baseline "$((since > 0))"
+    kv dumps_total "$(grep -c . <<<"$units")"
+    kv dumps_new "$( ((since > 0)) && dumps_since "$since" || echo 0)"
+    newest=$(sort -n <<<"$units" | tail -n 1 | cut -d' ' -f1)
+    if [[ -n $newest ]]; then kv dumps_newest "$(date -d "@$newest" '+%F %H:%M')"; else kv dumps_newest -; fi
+    kv timer_total "$(grep -c . <<<"$timer")"
+    kv timer_new "$(awk -v s="$since" 'NR == FNR { t = $1; sub(/^[^ ]+ /, ""); m[$0] = t; next }
+                                       s > 0 && ($0 in m) && m[$0] > s' <(echo "$units") <(echo "$timer") | grep -c .)"
+    kv cpu_hist "$(cpu_hist)"
+    while read -r l; do kv cleanup "$l"; done < <(cleanup_info)
+    while read -r l; do kv timer_watch "$l"; done < <(timer_watch_info)
+
+    IFS='|' read -r w wp <<<"$(worker_state)"
+    kv worker "$w"; kv worker_policy "$wp"
+    kv models "$(model_containers | tr '\n' ' ' | sed 's/ $//')"
+    if grep -qxF 'kernel.ftrace_dump_on_oops = 1' "$CRASHDEBUG_CONF" 2>/dev/null; then kv crashdebug yes; else kv crashdebug no; fi
+    print_node "$KV"
+}
+
+print_node() {   # $1 summary file
+    local f=$1 n
+    pl() { printf '  %-15s %s\n' "$1" "$2"; }
+    echo; echo -e "${CYAN}== $(kvg "$f" fqdn)   $(kvg "$f" date)${NC}"
+    pl kernel        "running $(kvg "$f" kernel_run), newest installed $(kvg "$f" kernel_new)"
+    pl bios          "$(kvg "$f" bios)"
+    pl driver        "loaded $(kvg "$f" driver | grep . || echo NONE), module license $(kvg "$f" license)"
+    pl nvidia-open   "installed $(kvg "$f" nvopen_inst), newest available $(kvg "$f" nvopen_avail)"
+    pl kmod-dkms     "installed $(kvg "$f" kmod_inst), newest available $(kvg "$f" kmod_avail)"
+    sed -n 's/^dkms=//p' "$f" | awk -F'|' '{ printf "  %-15s %-34s %-8s %s\n", "dkms", $1, $2, $3 }'
+    pl irqbalance    "$(kvg "$f" irq)   (reported, never changed)"
+    pl kdump         "$(kvg "$f" kdump_status), kexec_crash_loaded=$(kvg "$f" kdump_loaded)"
+    if [[ $(kvg "$f" baseline) == 1 ]]; then n="$(kvg "$f" dumps_new) new since the last check"
+    else n="no baseline yet, this run sets it"; fi
+    pl "crash dumps"   "$(kvg "$f" dumps_total) total, $n, newest $(kvg "$f" dumps_newest)"
+    pl "timer bug"     "$(kvg "$f" timer_total) dumps match $TIMER_SIG ($(kvg "$f" timer_new) new)"
+    pl "crash CPUs"    "$(kvg "$f" cpu_hist | grep . || echo -)"
+    sed -n 's/^cleanup=//p' "$f" | while read -r l; do pl crash-cleanup "$l"; done
+    sed -n 's/^timer_watch=//p' "$f" | while read -r l; do pl timer-watch "$l"; done
+    pl gpustack      "worker $(kvg "$f" worker), restart=$(kvg "$f" worker_policy); models: $(kvg "$f" models | grep . || echo none)"
+    pl crashdebug    "$CRASHDEBUG_CONF $(kvg "$f" crashdebug)"
+    [[ $(kvg "$f" repo_ok) == 1 ]] || pl repoquery "FAILED, newest versions unknown"
+    pl "version locks" "$(grep -c '^lock=' "$f") entries"
+    sed -n 's/^lock=//p' "$f" | lock_detail
+    unset -f pl
+}
+
+node_flags() {   # $1 summary file, $2 newest driver in the fleet. One line per problem.
+    local f=$1 d n
+    n=$(grep -c '^lock=BEHIND|' "$f"); ((n)) && echo "$n packages locked behind available updates"
+    [[ $(kvg "$f" repo_ok) == 1 ]] || echo "repoquery failed, available versions unknown"
+    d=$(kvg "$f" driver)
+    if [[ -z $d ]]; then echo "no NVIDIA driver loaded"
+    elif [[ $d != "$2" ]]; then echo "driver $d differs from $2 elsewhere in the fleet"; fi
+    sed -n 's/^dkms=//p' "$f" | awk -F'|' '$2 != "ok" { print "no nvidia module built for kernel " $1 }'
+    n=$(kvg "$f" dumps_new); ((n)) && echo "$n new crash dumps"
+    n=$(kvg "$f" timer_new); ((n)) && echo "$n new dumps with the timer signature"
+    [[ $(kvg "$f" kdump_loaded) == 1 ]] || echo "kdump not armed"
+    return 0
+}
+
+table_row() {    # one row per summary file, or the header with no argument
+    row() { printf '%-8s %-7s %-9s %-9s %-11s %-10s %-4s %-20s %-20s %-14s %-17s %-6s %-23s %-6s %-16s %s\n' "$@"; }
+    kab() { local k=${1#*-}; echo "${k%.el*}"; }
+    ia()  { local i a; i=$(evr_ver "$1"); a=$(evr_ver "$2")
+            if [[ $i == - || $a == - || $i == "$a" ]]; then echo "$i"; else echo "$i>$a"; fi; }
+    if (($# == 0)); then
+        row NODE UP KERNEL NEWEST BIOS DRIVER FLAV NVIDIA-OPEN KMOD-DKMS DKMS IRQBALANCE KDUMP "DUMPS tot/new/newest" TIMER WORKER LOCKS
+        return 0
+    fi
+    local f=$1 up lic flav dk dumps nl nb
+    up=$(kvg "$f" uptime_s); up="$((up / 86400))d$(( up % 86400 / 3600 ))h"
+    lic=$(kvg "$f" license)
+    case $lic in *GPL*|*MIT*) flav=open ;; "") flav=- ;; *) flav=prop ;; esac
+    dk=$(sed -n 's/^dkms=//p' "$f" | awk -F'|' '$2 != "ok" { print $1; exit }')
+    if [[ -n $dk ]]; then dk="MISS:$(kab "$dk")"; else dk=ok; fi
+    dumps="$(kvg "$f" dumps_total)/$( [[ $(kvg "$f" baseline) == 1 ]] && kvg "$f" dumps_new || echo -)/$(kvg "$f" dumps_newest | cut -d' ' -f1)"
+    nl=$(grep -c '^lock=' "$f"); nb=$(grep -c '^lock=BEHIND|' "$f")
+    row "$(kvg "$f" host)" "$up" "$(kab "$(kvg "$f" kernel_run)")" "$(kab "$(kvg "$f" kernel_new)")" \
+        "$(kvg "$f" bios)" "$(kvg "$f" driver | grep . || echo NONE)" "$flav" \
+        "$(ia "$(kvg "$f" nvopen_inst)" "$(kvg "$f" nvopen_avail)")" "$(ia "$(kvg "$f" kmod_inst)" "$(kvg "$f" kmod_avail)")" \
+        "$dk" "$(kvg "$f" irq)" "$( [[ $(kvg "$f" kdump_loaded) == 1 ]] && echo armed || echo NOT)" "$dumps" \
+        "$(kvg "$f" timer_total)" "$(kvg "$f" worker)/$(kvg "$f" worker_policy)" \
+        "$( ((nl)) && echo "$nb/$nl behind" || echo -)"
+}
+
+# The table holds this node plus every other node's last --check found in
+# ./reports (collect the summary-*.env files there to compare the fleet).
+fleet_report() {   # $1 this node's summary. Returns 1 if this node has a problem.
+    local own=$1 f l host newest flags files=("$1")
+    shopt -s nullglob
+    for f in "$REPORT_DIR"/summary-*.env; do [[ $f -ef $own ]] || files+=("$f"); done
+    shopt -u nullglob
+
+    echo; table_row
+    for f in "${files[@]}"; do table_row "$f"; done
+    if ((${#files[@]} > 1)); then
+        echo "(other rows: last --check of those nodes, from $REPORT_DIR/summary-*.env)"
+        for f in "${files[@]:1}"; do echo "   $(kvg "$f" host) as of $(kvg "$f" date)"; done
+    else
+        echo "(only this node in $REPORT_DIR; copy the other nodes' summary-*.env here to compare the fleet)"
+    fi
+
+    echo
+    for f in "${files[@]}"; do
+        sed -n 's/^lock=//p' "$f" | lock_block "$(kvg "$f" host)" && echo
+    done
+    newest=$(for f in "${files[@]}"; do kvg "$f" driver; done | grep . | sort -V | tail -n 1)
+    for f in "${files[@]}"; do
+        [[ $(kvg "$f" driver) == "$newest" ]] \
+            || echo "!! $(kvg "$f" host): loaded driver $(kvg "$f" driver | grep . || echo NONE), newest in the fleet $newest"
+    done
+
+    host=$(kvg "$own" host)
+    flags=$(node_flags "$own" "$newest")
+    if [[ -n $flags ]]; then
+        echo; log_error "$host: check failed"; while read -r l; do echo "   $l"; done <<<"$flags"; return 1
+    fi
+    echo; log_success "$host: all checks passed"; return 0
+}
+
+start_log() {   # $1 mode. From here on everything also goes to ./reports/
+    mkdir -p "$REPORT_DIR" "$STATE_DIR" || exit 2
+    RUN_LOG="$REPORT_DIR/$(date +%Y%m%d-%H%M%S)-$1-$(hostname -s).log"
+    exec > >(tee >(sed -u 's/\x1b\[[0-9;]*m//g' >> "$RUN_LOG")) 2>&1
+    log_info "log: $RUN_LOG"
+}
+
+do_check() (
+    require_root || exit 2
+    start_log check
+    SUM="$REPORT_DIR/summary-$(hostname -s).env"
+    probe "$(cat "$STATE_DIR/last-check" 2>/dev/null || echo 0)" "$SUM"
+    fleet_report "$SUM"; rc=$?
+    kvg "$SUM" now > "$STATE_DIR/last-check"
+    exit $rc
+)
+
+# --- update ------------------------------------------------------------------
+# Steps 1-9 run in one go and end with the reboot. Their record goes to
+# $STATE_DIR/update.state; while it exists the node is drained with
+# gpustack-worker restart=no, and the next --update resumes at step 10.
+do_update() (
+    DRY=0
+    for a in "$@"; do case $a in
+        --update) ;;
+        --dry-run) DRY=1 ;;
+        *) log_error "unknown option: $a"; exit 2 ;;
+    esac; done
+    require_root || exit 2
+    start_log "update$( ((DRY)) && echo -dry)"
+    exec 9>/var/lock/node-maintenance.lock
+    flock -n 9 || { log_error "maintenance or another update is running"; exit 30; }
+
+    HOST=$(hostname -s) ST=$STATE_DIR/update.state SUM="$REPORT_DIR/summary-$(hostname -s).env"
+    run()  { if ((DRY)); then echo "DRY: $*"; else echo "+ $*"; "$@"; fi; }
+    ask()  { local a; read -r -p "$1 [Y/n] " a || return 1; [[ $a != [nN]* ]]; }   # Enter = yes
+    die()  { log_error "$HOST: $*"; exit 1; }
+    save() { ((DRY)) || printf '%s=%s\n' "$1" "$2" >> "$ST"; }
+    chk()  { local msg=$1; shift     # chk "message" test-command...
+             if "$@"; then echo -e "  ${GREEN}ok${NC}    $msg"; else echo -e "  ${RED}FAIL${NC}  $msg"; return 1; fi; }
+    backup_vlock() { b="$VLOCK.bak-$(date +%Y%m%d-%H%M%S)"   # sets $b
+                     [[ ! -e $b ]] || b+="-$$-$RANDOM"         # never overwrite an earlier backup
+                     run cp -p "$VLOCK" "$b"; }
+    driver_inst() { evr_ver "$(rpm_evr kmod-nvidia-open-dkms)"; }
+
+    # steps 10-12
+    update_finish() {
+        local k nv smi irq n fails=0 models left t
+        if [[ $(kvg "$ST" phase) == watch && $(kvg "$ST" boot_watch) != "$(boot_id)" ]]; then
+            die "$HOST rebooted during the watch window (crash?). gpustack-worker restart policy is still 'no'. Look at $CRASH_DIR; remove $ST once resolved."
+        fi
+
+        echo -e "\n${CYAN}== step 10: verify${NC}"
+        k=$(kernels_installed | tail -n 1); nv=$(driver_inst)
+        chk "running kernel $(uname -r), newest installed $k" test "$(uname -r)" = "$k" || fails=1
+        smi=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>&1 | head -n 1)
+        chk "nvidia-smi: $smi, installed driver $nv" test "$smi" = "$nv" || fails=1
+        irq=$(irq_state)
+        chk "irqbalance $irq, before the update $(kvg "$ST" irq_before)" test "$irq" = "$(kvg "$ST" irq_before)" || fails=1
+        for _ in $(seq 36); do [[ $(cat /sys/kernel/kexec_crash_loaded 2>/dev/null) == 1 ]] && break; sleep 5; done
+        chk "kdump armed" test "$(cat /sys/kernel/kexec_crash_loaded 2>/dev/null)" = 1 || fails=1
+        n=$(dumps_since "$(kvg "$ST" since)")
+        chk "$n new crash dumps since the update started" test "$n" -eq 0 || fails=1
+        ((fails == 0)) || die "verification failed. Node stays drained, gpustack-worker restart=no. Fix it and run --update again."
+
+        echo -e "\n${CYAN}== step 11: start gpustack-worker${NC}"
+        if [[ $(kvg "$ST" worker) == running ]]; then
+            run docker start gpustack-worker || die "cannot start gpustack-worker"
+            models=$(kvg "$ST" models); left=$models
+            for _ in $(seq 60); do
+                left=$(for m in $models; do [[ $(docker inspect -f '{{.State.Running}}' "$m" 2>/dev/null) == true ]] || echo "$m"; done)
+                [[ -z $left ]] && break
+                sleep 10
+            done
+            chk "model containers back: ${models:-none}${left:+; missing: $(tr '\n' ' ' <<<"$left")}" test -z "$left" \
+                || die "model containers did not return within 10 min"
+        else
+            echo "  gpustack-worker was '$(kvg "$ST" worker)' before the update, not starting it"
+        fi
+
+        # restart=no stays until the node has survived the window, so a crash
+        # in it cannot turn into a boot loop
+        echo -e "\n${CYAN}== step 12: watch $WATCH_MIN min${NC}"
+        save phase watch; save boot_watch "$(boot_id)"; t=$(date +%s)
+        for ((n = WATCH_MIN; n > 0; n -= 5)); do
+            echo "  $n min left"; sleep $(( (n < 5 ? n : 5) * 60 ))
+        done
+        n=$(dumps_since "$t")
+        chk "$n new crash dumps during the watch" test "$n" -eq 0 || die "crash dump during the watch window, restart policy stays 'no'"
+        chk "kdump still armed" test "$(cat /sys/kernel/kexec_crash_loaded 2>/dev/null)" = 1 || die "kdump disarmed during the watch"
+
+        [[ $(kvg "$ST" worker) == absent ]] || run docker update --restart="$(kvg "$ST" worker_policy)" gpustack-worker \
+            || die "cannot restore restart=$(kvg "$ST" worker_policy)"
+        date +%s > "$STATE_DIR/last-check"
+        rm -f "$ST"
+        log_success "$HOST done: kernel $k, driver $nv. Next node."
+    }
+
+
+    if [[ -e $ST ]]; then
+        log_info "unfinished update from $(kvg "$ST" started), resuming at verification"
+        ((DRY)) && { sed 's/^/  /' "$ST"; exit 0; }
+        update_finish; exit $?
+    fi
+    # dumps newer than the last --check count as new; without one, the last 7 days
+    since=$(cat "$STATE_DIR/last-check" 2>/dev/null || echo $(( $(date +%s) - 7 * 86400 )))
+
+    echo -e "\n${CYAN}== step 1: checks${NC}"
+    probe "$since" "$SUM"
+    sed -n 's/^lock=//p' "$SUM" | lock_block "$HOST"
+    n=$(kvg "$SUM" dumps_new)
+    if [[ -e $STATE_DIR/last-check ]]; then when="since the last check"; else when="in the last 7 days"; fi
+    ((n == 0)) || die "$n new crash dump(s) $when, newest $(kvg "$SUM" dumps_newest). Not updating a crashing node. Look at $CRASH_DIR; once they are understood, run --check (marks them as seen) and --update again."
+
+    # Every lock is removed unless the operator picks a group to keep.
+    echo -e "\n${CYAN}== step 2: version locks${NC}"
+    keep=() gid=()
+    groups=$(sed -n 's/^lock=//p' "$SUM" | lock_groups)
+    if [[ -n $groups ]]; then
+        echo "These version locks will be removed so everything updates:"
+        while IFS='|' read -r g label text; do
+            gid+=("$g"); printf '  %d) %-14s %s\n' "${#gid[@]}" "$label" "$text"
+        done <<<"$groups"
+        read -r -p "Keep any of them locked? Enter = none, or numbers (e.g. 1): " ans || ans=
+        for x in $ans; do
+            if [[ $x =~ ^[0-9]+$ ]] && ((x >= 1 && x <= ${#gid[@]})); then keep+=("${gid[x - 1]}")
+            else log_warning "ignoring '$x'"; fi
+        done
+        drop=$(sed -n 's/^lock=//p' "$SUM" | awk -F'|' -v keep=" ${keep[*]} " 'index(keep, " " $2 " ") == 0 { print $3 }' | sort -u)
+        if ((${#keep[@]})); then echo "  keeping: ${keep[*]}"; else echo "  keeping: nothing, all locks go"; fi
+        if [[ -n $drop ]]; then
+            backup_vlock || die "cannot back up $VLOCK"
+            bak=$b
+            if ((${#keep[@]})); then
+                mapfile -t dn <<<"$drop"; run dnf versionlock delete "${dn[@]}" || die "dnf versionlock delete failed"
+            else
+                run dnf versionlock clear || die "dnf versionlock clear failed"
+            fi
+        fi
+    fi
+
+    echo -e "\n${CYAN}== transaction${NC}"
+    pv=(--refresh)
+    ((DRY && ${#keep[@]} == 0)) && pv+=(--disableplugin=versionlock)   # dry run: locks still in place
+    dnf "${pv[@]}" upgrade --assumeno 2>&1 \
+        | awk -v hi="$YELLOW" -v n="$NC" '/nvidia|kernel/ { print hi $0 n; next } { print }'
+    if ! ask "Proceed?"; then
+        [[ -z ${bak:-} ]] || run cp -p "$bak" "$VLOCK"      # put the locks back as they were
+        log_info "$HOST: nothing changed"; exit 0
+    fi
+
+    echo -e "\n${CYAN}== step 3-4: drain GPU work${NC}"
+    IFS='|' read -r ws wp <<<"$(worker_state)"
+    models=$(model_containers | tr '\n' ' '); models=${models% }
+    echo "  gpustack-worker $ws, restart=$wp; model containers running: ${models:-none}"
+    for m in $models; do
+        [[ $(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$m" 2>/dev/null) == always ]] \
+            && log_warning "$m has restart=always and will start on boot by itself"
+    done
+    save started "$(date '+%F %T')"; save phase drained; save irq_before "$(irq_state)"
+    save worker "$ws"; save worker_policy "$wp"; save models "$models"
+    [[ $ws != running ]] || run docker stop gpustack-worker || die "cannot stop gpustack-worker"
+    for m in $models; do run docker stop "$m" || die "cannot stop $m"; done
+    [[ $ws == absent ]] || run docker update --restart=no gpustack-worker || die "cannot set restart=no"
+
+    if grep -qxF 'kernel.ftrace_dump_on_oops = 1' "$CRASHDEBUG_CONF" 2>/dev/null; then
+        echo "  $CRASHDEBUG_CONF already set"
+    elif ask "Set kernel.ftrace_dump_on_oops = 1 in $CRASHDEBUG_CONF?"; then
+        if ((DRY)); then echo "DRY: echo 'kernel.ftrace_dump_on_oops = 1' > $CRASHDEBUG_CONF"
+        else echo 'kernel.ftrace_dump_on_oops = 1' > "$CRASHDEBUG_CONF"; fi
+        run sysctl -p "$CRASHDEBUG_CONF"
+    fi
+
+    echo -e "\n${CYAN}== step 5-6: upgrade${NC}"
+    run dnf -y --refresh upgrade || die "dnf upgrade failed, node left drained"
+    run dnf -y --setopt=installonly_limit=2 remove --oldinstallonly || echo "  no old kernels removed"
+
+    nv=$(driver_inst)
+
+    echo -e "\n${CYAN}== step 8: pre-reboot gate${NC}"
+    k=$(kernels_installed | tail -n 1); gate=0
+    ((DRY)) && echo "  (dry run: nothing was upgraded, this is the state as it is now)"
+    st=$(dkms status -k "$k" 2>/dev/null | grep -E '^nvidia[/,]' | head -n 1)
+    chk "dkms status -k $k: ${st:-no nvidia entry}" grep -q ': installed' <<<"$st" || gate=1
+    chk "/lib/modules/$k/extra/nvidia.ko.xz" test -e "/lib/modules/$k/extra/nvidia.ko.xz" || gate=1
+    mv=$(modinfo -k "$k" -F version nvidia 2>/dev/null)
+    chk "module version ${mv:-none}, installed driver $nv" test "$mv" = "$nv" || gate=1
+    dk=$(grubby --default-kernel 2>/dev/null)
+    chk "grubby --default-kernel: $dk" test "$dk" = "/boot/vmlinuz-$k" || gate=1
+    ((gate == 0 || DRY)) || die "pre-reboot gate failed. Node stays drained, gpustack-worker restart=no. Fix it, reboot, then run --update again to verify and restore."
+
+    need=0; why=()
+    needs-restarting -r >/dev/null 2>&1 || { need=1; why+=("needs-restarting -r"); }
+    loaded=$(cat /sys/module/nvidia/version 2>/dev/null)
+    [[ $loaded == "$nv" ]] || { need=1; why+=("driver ${loaded:-none} -> $nv"); }
+    save kernel "$k"; save driver "$nv"; save since "$(date +%s)"; save boot_before "$(boot_id)"
+    if ((need)); then
+        echo "reboot required: ${why[*]}"
+        ((DRY)) && { echo "DRY: ask 'Reboot $HOST now?', systemctl reboot; the next --update verifies, starts gpustack-worker, watches $WATCH_MIN min, restores restart=$wp"; exit 0; }
+        ask "Reboot $HOST now?" || die "reboot declined. Node stays drained, gpustack-worker restart=no. Reboot later, then run --update again."
+        save phase rebooting
+        log_info "when $HOST is back, run: sudo $SELF --update   (verify, start gpustack-worker, ${WATCH_MIN}-minute watch)"
+        run systemctl reboot
+        exit 0
+    fi
+    ((DRY)) && { echo "DRY: no reboot needed now; next: verify, start gpustack-worker, watch $WATCH_MIN min, restore restart policy"; exit 0; }
+    update_finish
+)
+
 
 # =============================================================================
 # install / uninstall / status
@@ -678,6 +1253,9 @@ case "${1:-}" in
     install)     shift; banner; do_install "$@" ;;
     uninstall)   shift; do_uninstall ;;
     status)      shift; banner; do_status ;;
+    --check)     shift; [[ $# -eq 0 ]] || { log_error "--check takes no arguments, it checks this node"; exit 2; }
+                 do_check; exit $? ;;
+    --update|--dry-run) do_update "$@"; exit $? ;;
     "")          banner; menu ;;
     *)           log_error "unknown command: $1  (try --help)"; exit 2 ;;
 esac
