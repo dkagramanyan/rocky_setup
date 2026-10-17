@@ -129,12 +129,16 @@ maintenance() (
     mkdir -p "$MAINT_LOG_DIR"
     LOG="$MAINT_LOG_DIR/maintenance-$(date +%Y%m%d-%H%M%S).log"
     ln -sfn "$LOG" "$MAINT_LOG_DIR/latest.log"
-    exec > >(tee -a "$LOG") 2>&1
+    exec > >(tee >(sed -u 's/\x1b\[[0-9;]*m//g' >> "$LOG")) 2>&1
 
-    log()  { printf '%s  %s\n' "$(date '+%F %T')" "$*"; }
-    sec()  { printf '\n--- %s ---\n' "$*"; }
-    warn() { log "WARN: $*"; RC=20; }
-    run()  { if ((DRY)); then log "DRY: $*"; else log "+ $*"; "$@" || warn "rc=$? : $*"; fi; }
+    # One line per step on screen; command output goes to the log only.
+    log()  { printf '  %s\n' "$*"; }
+    ok()   { ((DRY)) || printf '  %b✓%b %s\n' "$GREEN" "$NC" "$*"; }
+    sec()  { printf '%b%s%b\n' "$CYAN" "$*" "$NC"; }
+    warn() { printf '  %b!!%b %s\n' "$YELLOW" "$NC" "$*"; RC=20; }
+    quiet() { { printf '%s  + %s\n' "$(date '+%F %T')" "$*"; "$@"; } >> "$LOG" 2>&1; }
+    run()  { if ((DRY)); then log "DRY: $*"; else quiet "$@" || warn "failed (exit $?): $*  (see $LOG)"; fi; }
+    disk() { df -P / /boot /home 2>/dev/null | awk 'NR > 1 { printf "%s%s %s", (NR > 2 ? "  " : ""), $6, $5 } END { print "" }'; }
 
     exec 9>/var/lock/node-maintenance.lock
     flock -n 9 || { log "another instance is running"; exit 30; }
@@ -149,20 +153,22 @@ maintenance() (
         sleep "$JITTER"
     fi
 
-    log "$(hostname -f)  kernel $(uname -r)  $(cat /etc/rocky-release 2>/dev/null)"
-    sec "disk before"; df -h / /boot /home 2>/dev/null
+    sec "$(hostname -f)  $(date '+%F %T')"
+    log "kernel $(uname -r), $(cat /etc/rocky-release 2>/dev/null)"
+    log "disk: $(disk)"
+    df -h / /boot /home >> "$LOG" 2>&1
 
     if ((FORCE == 0 && MAINT_SKIP_IF_BUSY == 1)) && node_busy; then
         log "GPU or Slurm work in progress, skipping"
         busy_reason | sed 's/^/  /'
-        log "run with --force (menu: 'Force maintenance') to clean anyway;"
+        log "run with --force (menu: 'Clean up') to clean anyway;"
         log "with MAINT_REBOOT_MODE=$MAINT_REBOOT_MODE a forced run will not reboot the node"
         exit 10
     fi
 
     # --- kernels and /boot ---------------------------------------------------
-    sec "kernel pruning"
-    rpm -q kernel-core --qf '  %{VERSION}-%{RELEASE}.%{ARCH}\n' | sort -V
+    sec "kernels"
+    KBEFORE=$(kernels_installed)
     if grep -q '^installonly_limit' /etc/dnf/dnf.conf 2>/dev/null; then
         run sed -i "s/^installonly_limit=.*/installonly_limit=$MAINT_KEEP_KERNELS/" /etc/dnf/dnf.conf
     elif ((DRY)); then
@@ -170,13 +176,18 @@ maintenance() (
     else
         echo "installonly_limit=$MAINT_KEEP_KERNELS" >> /etc/dnf/dnf.conf
     fi
-    run dnf -y --setopt="installonly_limit=$MAINT_KEEP_KERNELS" remove --oldinstallonly
+    if (( $(grep -c . <<<"$KBEFORE") > MAINT_KEEP_KERNELS )); then
+        run dnf -y --setopt="installonly_limit=$MAINT_KEEP_KERNELS" remove --oldinstallonly
+    fi
+    GONE=$(comm -23 <(sort <<<"$KBEFORE") <(kernels_installed | sort) | tr '\n' ' ')
+    if [[ -n $GONE ]]; then ok "removed old kernel $GONE"
+    else ok "$(grep -c . <<<"$KBEFORE") kernels installed, nothing to remove"; fi
 
     shopt -s nullglob
     for img in /boot/initramfs-*.img; do
         v=${img#/boot/initramfs-}; v=${v%.img}; v=${v%kdump}; v=${v%.}
         [[ $v == *rescue* || -d /lib/modules/$v ]] && continue
-        log "orphan artifacts for absent kernel $v"
+        log "orphan files of absent kernel $v removed"
         run rm -f "/boot/initramfs-$v.img" "/boot/initramfs-${v}kdump.img" \
                   "/boot/vmlinuz-$v" "/boot/System.map-$v" "/boot/config-$v" \
                   "/boot/symvers-$v.xz" /boot/loader/entries/*"$v".conf
@@ -190,29 +201,35 @@ maintenance() (
 
     # --- upgrade -------------------------------------------------------------
     if ((UPDATE)); then
-        # A lock makes dnf skip a package without a word. Say so in the log.
-        sec "version locks"
+        # A lock makes dnf skip a package without a word. Say so.
+        sec "packages"
         LOCKS=$(locks_now) || warn "repoquery failed, cannot tell whether the locks hold anything back"
-        if [[ -z $LOCKS ]]; then
-            log "no version locks"
-        else
-            lock_detail <<<"$LOCKS"
-            lock_block "$(hostname -s)" <<<"$LOCKS" \
-                && warn "version locks hold packages back, this upgrade skips them (decide with: sudo $BIN --update)"
+        if [[ -n $LOCKS ]]; then
+            lock_detail <<<"$LOCKS" >> "$LOG"
+            lock_block "$(hostname -s)" <<<"$LOCKS" | sed 's/^/  /' \
+                && warn "these locks are skipped by this upgrade (to update them: sudo $BIN --update)"
         fi
 
-        sec "upgrade"
         ARGS=(--refresh); for p in $MAINT_EXCLUDE_PKGS; do ARGS+=("--exclude=$p"); done
         ((MAINT_SECURITY_ONLY)) && ARGS+=(--security)
-        dnf check-update "${ARGS[@]}" 2>/dev/null | sed 's/^/  /' || true
+        PBEFORE=$(rpm -qa | sort)
         run dnf -y "${ARGS[@]}" upgrade
-        dnf autoremove --assumeno 2>&1 | grep -E '^\s+\S+\s+x86_64|Remove' | sed 's/^/  would-remove /' || true
+        if ((DRY)); then
+            log "DRY: $(dnf -q "${ARGS[@]}" repoquery --upgrades --latest-limit=1 2>/dev/null | grep -c .) packages would be upgraded"
+        else
+            ok "upgrade: $(comm -13 <(echo "$PBEFORE") <(rpm -qa | sort) | grep -c .) packages installed or updated"
+        fi
+        AUTO=$(dnf autoremove --assumeno 2>&1 | grep -E '^\s+\S+\s+(x86_64|noarch)' || true)
+        if [[ -n $AUTO ]]; then
+            { echo "autoremove would remove:"; echo "$AUTO"; } >> "$LOG"
+            log "autoremove would remove $(grep -c . <<<"$AUTO") packages (MAINT_AUTOREMOVE=$MAINT_AUTOREMOVE, list in the log)"
+        fi
         ((MAINT_AUTOREMOVE)) && run dnf -y autoremove
     fi
 
     # --- cleanup -------------------------------------------------------------
     if ((CLEAN)); then
-        sec "caches, logs, tmp"
+        sec "cleanup"
         run dnf clean all
         run journalctl --vacuum-time="$MAINT_JOURNAL_AGE"
         run journalctl --vacuum-size="$MAINT_JOURNAL_SIZE"
@@ -229,7 +246,7 @@ maintenance() (
                 log "SKIP $d — looks like a model store, not touching it"
                 continue
             fi
-            log "$(du -sh "$d" 2>/dev/null | cut -f1) in $d"
+            echo "$(du -sh "$d" 2>/dev/null | cut -f1) in $d" >> "$LOG"
             ((DRY)) || { find "$d" -xdev -mindepth 1 -type f -atime "+$MAINT_TMP_AGE_DAYS" -delete 2>/dev/null
                          find "$d" -xdev -mindepth 1 -type d -empty -atime "+$MAINT_TMP_AGE_DAYS" -delete 2>/dev/null; }
         done
@@ -241,38 +258,37 @@ maintenance() (
             systemctl is-active --quiet docker && run docker system prune -f --filter until=168h
             command -v podman >/dev/null && run podman system prune -f --filter until=168h
         fi
+        ok "dnf cache, journal, old logs, tmp, unused containers"
 
-        sec "logical volumes"
-        lvm_report
+        lvm_report >> "$LOG"
         # fstrim frees nothing in df; it tells the SSD which blocks the
         # filesystems stopped using, which is what keeps a thin pool honest.
         if ((MAINT_FSTRIM)); then
-            if command -v fstrim >/dev/null; then run fstrim -av
+            if command -v fstrim >/dev/null; then run fstrim -av; ok "fstrim"
             else log "fstrim not installed (dnf install util-linux), skipping trim"; fi
         fi
     fi
 
     # --- firewall ------------------------------------------------------------
-    if ((MAINT_DISABLE_FIREWALL)); then
-        sec "firewalld"
+    if ((MAINT_DISABLE_FIREWALL)) && [[ $(systemctl is-enabled firewalld 2>/dev/null) != masked ]]; then
         if systemctl list-unit-files firewalld.service &>/dev/null; then
             run systemctl disable --now firewalld
             run systemctl mask firewalld
+            log "firewalld: $(systemctl is-enabled firewalld 2>&1) / $(systemctl is-active firewalld 2>&1)"
         fi
-        log "state: $(systemctl is-enabled firewalld 2>&1) / $(systemctl is-active firewalld 2>&1)"
     fi
 
     # --- GPU and reboot ------------------------------------------------------
     sec "GPU"
     if command -v nvidia-smi >/dev/null; then
-        nvidia-smi --query-gpu=index,name,driver_version,memory.used,memory.total,temperature.gpu \
-            --format=csv 2>&1 | sed 's/^/  /' \
-            || warn "nvidia-smi failed, driver and loaded module likely mismatched, reboot needed"
-        command -v dkms >/dev/null && dkms status 2>&1 | sed 's/^/  /'
-        modinfo nvidia 2>/dev/null | awk '/^license:/{print "  module license: "$2}'
+        if GPU=$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>&1); then
+            log "$GPU, module license $(modinfo -F license nvidia 2>/dev/null)"
+        else
+            warn "nvidia-smi failed, driver and loaded module likely mismatched, reboot needed"
+        fi
+        command -v dkms >/dev/null && dkms status >> "$LOG" 2>&1
     fi
 
-    sec "reboot"
     NEED=0
     if command -v needs-restarting >/dev/null; then
         needs-restarting -r >/dev/null 2>&1 || NEED=1
@@ -280,19 +296,21 @@ maintenance() (
         [[ $(uname -r) != "$(rpm -q kernel-core --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' | sort -V | tail -1)" ]] && NEED=1
     fi
     if ((NEED)); then
-        log "reboot required (mode=$MAINT_REBOOT_MODE)"
         case $MAINT_REBOOT_MODE in
-            if-needed) run shutdown -r "+$MAINT_REBOOT_DELAY_MIN" "maintenance reboot" ;;
-            if-idle)   if node_busy; then log "busy, not rebooting"
-                       else run shutdown -r "+$MAINT_REBOOT_DELAY_MIN" "maintenance reboot"; fi ;;
-            *)         log "not rebooting, do it manually" ;;
+            if-needed) log "reboot required, rebooting in $MAINT_REBOOT_DELAY_MIN min"
+                       run shutdown -r "+$MAINT_REBOOT_DELAY_MIN" "maintenance reboot" ;;
+            if-idle)   if node_busy; then log "reboot required, node busy, not rebooting"
+                       else log "reboot required, rebooting in $MAINT_REBOOT_DELAY_MIN min"
+                            run shutdown -r "+$MAINT_REBOOT_DELAY_MIN" "maintenance reboot"; fi ;;
+            *)         log "reboot required, do it manually (or menu: Update)" ;;
         esac
     else
         log "no reboot required"
     fi
 
-    sec "disk after"; df -h / /boot /home 2>/dev/null
-    log "exit $RC"
+    sec "done"
+    log "disk: $(disk)"
+    log "exit $RC, full log: $LOG"
     [[ -n $MAINT_MAIL_TO ]] && command -v mail >/dev/null && \
         mail -s "[maint] $(hostname -s) rc=$RC$( ((NEED)) && echo ' REBOOT-NEEDED')" "$MAINT_MAIL_TO" < "$LOG"
     exit $RC
@@ -609,7 +627,7 @@ cpu_hist() {     # CPU12:190 CPU3:4
 cleanup_info() {
     local f
     systemctl cat crash-cleanup.service >/dev/null 2>&1 || { echo "no crash-cleanup.service"; return 0; }
-    echo "timer $(unit_state crash-cleanup.timer), next run $(systemctl show -p NextElapseUSecRealtime --value crash-cleanup.timer 2>/dev/null)"
+    echo "timer $(unit_state crash-cleanup.timer)"
     systemctl cat crash-cleanup.service crash-cleanup.timer 2>/dev/null | grep -E '^(Exec|OnCalendar|OnBootSec|OnUnitActiveSec)'
     for f in $(systemctl show -p ExecStart --value crash-cleanup.service | tr -s ' ;' '\n' \
                | sed -E 's/^(path|argv\[\])=//' | grep '^/' | sort -u); do
@@ -645,6 +663,8 @@ probe() {   # $1 crash baseline (epoch, 0 = none yet), $2 summary file to write
     kv host "$(hostname -s)"; kv fqdn "$(hostname -f)"
     kv now "$(date +%s)"; kv date "$(date '+%F %T')"; kv boot_id "$(boot_id)"
     kv uptime_s "$(cut -d. -f1 /proc/uptime)"
+    kv disk "$(df -P / /boot /home 2>/dev/null | awk 'NR > 1 { printf "%s%s %s", (NR > 2 ? "  " : ""), $6, $5 }')"
+    kv schedule "$(sched_state)"
     kv kernel_run "$(uname -r)"; kv kernel_new "$(kernels_installed | tail -n 1)"
     kv bios "$(dmidecode -s bios-version 2>/dev/null || cat /sys/class/dmi/id/bios_version 2>/dev/null)"
     kv driver "$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n 1)"
@@ -666,7 +686,7 @@ probe() {   # $1 crash baseline (epoch, 0 = none yet), $2 summary file to write
     done < <(kernels_installed)
 
     kv irq "$(irq_state)"
-    kv kdump_status "$(kdumpctl status 2>&1 | tail -n 1)"
+    kv kdump_status "$(kdumpctl status 2>&1 | grep -m1 -i 'kdump is' || kdumpctl status 2>&1 | tail -n 1)"
     kv kdump_loaded "$(cat /sys/kernel/kexec_crash_loaded 2>/dev/null || echo 0)"
 
     units=$(dump_units); timer=$(timer_units)
@@ -689,31 +709,43 @@ probe() {   # $1 crash baseline (epoch, 0 = none yet), $2 summary file to write
     print_node "$KV"
 }
 
-print_node() {   # $1 summary file
-    local f=$1 n
-    pl() { printf '  %-15s %s\n' "$1" "$2"; }
+print_node() {   # $1 summary file. Short report on screen, full detail in the run log.
+    local f=$1 n k bad nk drv av lic
+    pl() { printf '  %-12s %s\n' "$1" "$2"; }
     echo; echo -e "${CYAN}== $(kvg "$f" fqdn)   $(kvg "$f" date)${NC}"
-    pl kernel        "running $(kvg "$f" kernel_run), newest installed $(kvg "$f" kernel_new)"
-    pl bios          "$(kvg "$f" bios)"
-    pl driver        "loaded $(kvg "$f" driver | grep . || echo NONE), module license $(kvg "$f" license)"
-    pl nvidia-open   "installed $(kvg "$f" nvopen_inst), newest available $(kvg "$f" nvopen_avail)"
-    pl kmod-dkms     "installed $(kvg "$f" kmod_inst), newest available $(kvg "$f" kmod_avail)"
-    sed -n 's/^dkms=//p' "$f" | awk -F'|' '{ printf "  %-15s %-34s %-8s %s\n", "dkms", $1, $2, $3 }'
-    pl irqbalance    "$(kvg "$f" irq)   (reported, never changed)"
-    pl kdump         "$(kvg "$f" kdump_status), kexec_crash_loaded=$(kvg "$f" kdump_loaded)"
-    if [[ $(kvg "$f" baseline) == 1 ]]; then n="$(kvg "$f" dumps_new) new since the last check"
-    else n="no baseline yet, this run sets it"; fi
-    pl "crash dumps"   "$(kvg "$f" dumps_total) total, $n, newest $(kvg "$f" dumps_newest)"
-    pl "timer bug"     "$(kvg "$f" timer_total) dumps match $TIMER_SIG ($(kvg "$f" timer_new) new)"
-    pl "crash CPUs"    "$(kvg "$f" cpu_hist | grep . || echo -)"
-    sed -n 's/^cleanup=//p' "$f" | while read -r l; do pl crash-cleanup "$l"; done
-    sed -n 's/^timer_watch=//p' "$f" | while read -r l; do pl timer-watch "$l"; done
-    pl gpustack      "worker $(kvg "$f" worker), restart=$(kvg "$f" worker_policy); models: $(kvg "$f" models | grep . || echo none)"
-    pl crashdebug    "$CRASHDEBUG_CONF $(kvg "$f" crashdebug)"
-    [[ $(kvg "$f" repo_ok) == 1 ]] || pl repoquery "FAILED, newest versions unknown"
-    pl "version locks" "$(grep -c '^lock=' "$f") entries"
-    sed -n 's/^lock=//p' "$f" | lock_detail
+
+    k=$(kvg "$f" kernel_run)
+    if [[ $k == "$(kvg "$f" kernel_new)" ]]; then pl Kernel "$k"
+    else pl Kernel "$k running, $(kvg "$f" kernel_new) installed (reboot to use it)"; fi
+    drv=$(kvg "$f" driver); av=$(evr_ver "$(kvg "$f" kmod_avail)"); lic=$(kvg "$f" license)
+    case $lic in *GPL*|*MIT*) lic="open module" ;; "") lic="no module" ;; *) lic="proprietary module" ;; esac
+    if [[ -z $drv ]]; then pl Driver "NONE loaded ($lic)"
+    elif [[ $av != - && $av != "$drv" ]]; then pl Driver "$drv ($lic), $av available"
+    else pl Driver "$drv ($lic), newest"; fi
+    nk=$(grep -c '^dkms=' "$f"); bad=$(sed -n 's/^dkms=//p' "$f" | awk -F'|' '$2 != "ok" { printf "%s ", $1 }')
+    if [[ -n $bad ]]; then pl DKMS "nvidia module MISSING for $bad"; else pl DKMS "nvidia module built for all $nk kernels"; fi
+    pl BIOS "$(kvg "$f" bios)"
+    pl Disk "$(kvg "$f" disk)"
+    pl irqbalance "$(kvg "$f" irq)"
+    if [[ $(kvg "$f" kdump_loaded) == 1 ]]; then pl kdump armed; else pl kdump "NOT armed ($(kvg "$f" kdump_status))"; fi
+    if [[ $(kvg "$f" baseline) == 1 ]]; then n="$(kvg "$f" dumps_new) new"; else n="first check"; fi
+    pl Crashes "$(kvg "$f" dumps_total) dumps ($n), newest $(kvg "$f" dumps_newest)"
+    (( $(kvg "$f" timer_total) > 0 )) && pl "" "$(kvg "$f" timer_total) match the timer bug; by CPU: $(kvg "$f" cpu_hist)"
+    pl Cleanup "$(sed -n 's/^cleanup=//p' "$f" | grep -v '^Exec' | sed 's/^deletes? [^:]*:[0-9]*: *//' | paste -sd ';' | sed 's/;/; /g')"
+    pl "Timer watch" "$(sed -n 's/^timer_watch=//p' "$f" | paste -sd ';' | sed 's/;/; /g')"
+    n=$(kvg "$f" models | wc -w)
+    pl GPUStack "worker $(kvg "$f" worker) (restart=$(kvg "$f" worker_policy)), $n model containers"
+    pl Schedule "$(kvg "$f" schedule)"
+    [[ $(kvg "$f" repo_ok) == 1 ]] || pl Repos "repoquery FAILED, newest versions unknown"
+    pl Locks "$(grep -c '^lock=' "$f") locks, $(grep -c '^lock=BEHIND|' "$f") behind available updates"
     unset -f pl
+    [[ -z ${RUN_LOG:-} ]] || {
+        echo "--- detail"
+        sed -n 's/^dkms=//p' "$f" | awk -F'|' '{ printf "  dkms  %-34s %-8s %s\n", $1, $2, $3 }'
+        sed -n 's/^cleanup=//p' "$f" | sed 's/^/  crash-cleanup  /'
+        echo "  models: $(kvg "$f" models)"
+        sed -n 's/^lock=//p' "$f" | lock_detail
+    } >> "$RUN_LOG"
 }
 
 node_flags() {   # $1 summary file, $2 newest driver in the fleet. One line per problem.
@@ -763,18 +795,16 @@ fleet_report() {   # $1 this node's summary. Returns 1 if this node has a proble
     for f in "$REPORT_DIR"/summary-*.env; do [[ $f -ef $own ]] || files+=("$f"); done
     shopt -u nullglob
 
-    echo; table_row
-    for f in "${files[@]}"; do table_row "$f"; done
     if ((${#files[@]} > 1)); then
+        echo; table_row
+        for f in "${files[@]}"; do table_row "$f"; done
         echo "(other rows: last --check of those nodes, from $REPORT_DIR/summary-*.env)"
         for f in "${files[@]:1}"; do echo "   $(kvg "$f" host) as of $(kvg "$f" date)"; done
-    else
-        echo "(only this node in $REPORT_DIR; copy the other nodes' summary-*.env here to compare the fleet)"
     fi
 
     echo
     for f in "${files[@]}"; do
-        sed -n 's/^lock=//p' "$f" | lock_block "$(kvg "$f" host)" && echo
+        sed -n 's/^lock=//p' "$f" | lock_block "$(kvg "$f" host)"
     done
     newest=$(for f in "${files[@]}"; do kvg "$f" driver; done | grep . | sort -V | tail -n 1)
     for f in "${files[@]}"; do
@@ -824,7 +854,13 @@ do_update() (
     flock -n 9 || { log_error "maintenance or another update is running"; exit 30; }
 
     HOST=$(hostname -s) ST=$STATE_DIR/update.state SUM="$REPORT_DIR/summary-$(hostname -s).env"
-    run()  { if ((DRY)); then echo "DRY: $*"; else echo "+ $*"; "$@"; fi; }
+    # one line per command on screen, its output in the log; the tail on failure
+    run()  { if ((DRY)); then echo "  DRY: $*"; return 0; fi
+             echo "  + $*"
+             { echo "+ $*"; "$@"; } >> "$RUN_LOG" 2>&1 && return 0
+             local rc=$?
+             echo -e "  ${RED}failed (exit $rc)${NC}, end of $RUN_LOG:"; tail -n 15 "$RUN_LOG" | sed 's/^/    /'
+             return "$rc"; }
     ask()  { local a; read -r -p "$1 [Y/n] " a || return 1; [[ $a != [nN]* ]]; }   # Enter = yes
     die()  { log_error "$HOST: $*"; exit 1; }
     save() { ((DRY)) || printf '%s=%s\n' "$1" "$2" >> "$ST"; }
@@ -842,7 +878,7 @@ do_update() (
             die "$HOST rebooted during the watch window (crash?). gpustack-worker restart policy is still 'no'. Look at $CRASH_DIR; remove $ST once resolved."
         fi
 
-        echo -e "\n${CYAN}== step 10: verify${NC}"
+        echo -e "\n${CYAN}== after reboot: verify${NC}"
         k=$(kernels_installed | tail -n 1); nv=$(driver_inst)
         chk "running kernel $(uname -r), newest installed $k" test "$(uname -r)" = "$k" || fails=1
         smi=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>&1 | head -n 1)
@@ -855,7 +891,7 @@ do_update() (
         chk "$n new crash dumps since the update started" test "$n" -eq 0 || fails=1
         ((fails == 0)) || die "verification failed. Node stays drained, gpustack-worker restart=no. Fix it and run --update again."
 
-        echo -e "\n${CYAN}== step 11: start gpustack-worker${NC}"
+        echo -e "\n${CYAN}== start GPUStack${NC}"
         if [[ $(kvg "$ST" worker) == running ]]; then
             run docker start gpustack-worker || die "cannot start gpustack-worker"
             models=$(kvg "$ST" models); left=$models
@@ -872,7 +908,7 @@ do_update() (
 
         # restart=no stays until the node has survived the window, so a crash
         # in it cannot turn into a boot loop
-        echo -e "\n${CYAN}== step 12: watch $WATCH_MIN min${NC}"
+        echo -e "\n${CYAN}== watch $WATCH_MIN min for crashes${NC}"
         save phase watch; save boot_watch "$(boot_id)"; t=$(date +%s)
         for ((n = WATCH_MIN; n > 0; n -= 5)); do
             echo "  $n min left"; sleep $(( (n < 5 ? n : 5) * 60 ))
@@ -897,7 +933,7 @@ do_update() (
     # dumps newer than the last --check count as new; without one, the last 7 days
     since=$(cat "$STATE_DIR/last-check" 2>/dev/null || echo $(( $(date +%s) - 7 * 86400 )))
 
-    echo -e "\n${CYAN}== step 1: checks${NC}"
+    echo -e "\n${CYAN}== checks${NC}"
     probe "$since" "$SUM"
     sed -n 's/^lock=//p' "$SUM" | lock_block "$HOST"
     n=$(kvg "$SUM" dumps_new)
@@ -905,7 +941,7 @@ do_update() (
     ((n == 0)) || die "$n new crash dump(s) $when, newest $(kvg "$SUM" dumps_newest). Not updating a crashing node. Look at $CRASH_DIR; once they are understood, run --check (marks them as seen) and --update again."
 
     # Every lock is removed unless the operator picks a group to keep.
-    echo -e "\n${CYAN}== step 2: version locks${NC}"
+    echo -e "\n${CYAN}== version locks${NC}"
     keep=() gid=()
     groups=$(sed -n 's/^lock=//p' "$SUM" | lock_groups)
     if [[ -n $groups ]]; then
@@ -931,17 +967,25 @@ do_update() (
         fi
     fi
 
-    echo -e "\n${CYAN}== transaction${NC}"
+    echo -e "\n${CYAN}== what will be upgraded${NC}"
     pv=(--refresh)
     ((DRY && ${#keep[@]} == 0)) && pv+=(--disableplugin=versionlock)   # dry run: locks still in place
-    dnf "${pv[@]}" upgrade --assumeno 2>&1 \
-        | awk -v hi="$YELLOW" -v n="$NC" '/nvidia|kernel/ { print hi $0 n; next } { print }'
+    up=$(dnf -q "${pv[@]}" repoquery --upgrades --latest-limit=1 --qf '%{name} %{evr}' 2>>"$RUN_LOG" | sort -u)
+    { echo "--- dnf upgrade --assumeno"; LC_ALL=C dnf "${pv[@]}" upgrade --assumeno; } >> "$RUN_LOG" 2>&1
+    if [[ -z $up ]]; then
+        echo "  nothing to upgrade"
+    else
+        echo "  $(grep -c . <<<"$up") packages, the ones that matter:"
+        grep -E '^(kernel|nvidia-open|kmod-nvidia-open-dkms|nvidia-driver|cuda-toolkit|docker-ce) ' <<<"$up" \
+            | awk -v hi="$YELLOW" -v n="$NC" '{ printf "    %s%-24s %s%s\n", hi, $1, $2, n }'
+        echo "  (full transaction in $RUN_LOG)"
+    fi
     if ! ask "Proceed?"; then
         [[ -z ${bak:-} ]] || run cp -p "$bak" "$VLOCK"      # put the locks back as they were
         log_info "$HOST: nothing changed"; exit 0
     fi
 
-    echo -e "\n${CYAN}== step 3-4: drain GPU work${NC}"
+    echo -e "\n${CYAN}== stop GPUStack${NC}"
     IFS='|' read -r ws wp <<<"$(worker_state)"
     models=$(model_containers | tr '\n' ' '); models=${models% }
     echo "  gpustack-worker $ws, restart=$wp; model containers running: ${models:-none}"
@@ -958,18 +1002,18 @@ do_update() (
     if grep -qxF 'kernel.ftrace_dump_on_oops = 1' "$CRASHDEBUG_CONF" 2>/dev/null; then
         echo "  $CRASHDEBUG_CONF already set"
     elif ask "Set kernel.ftrace_dump_on_oops = 1 in $CRASHDEBUG_CONF?"; then
-        if ((DRY)); then echo "DRY: echo 'kernel.ftrace_dump_on_oops = 1' > $CRASHDEBUG_CONF"
+        if ((DRY)); then echo "  DRY: echo 'kernel.ftrace_dump_on_oops = 1' > $CRASHDEBUG_CONF"
         else echo 'kernel.ftrace_dump_on_oops = 1' > "$CRASHDEBUG_CONF"; fi
         run sysctl -p "$CRASHDEBUG_CONF"
     fi
 
-    echo -e "\n${CYAN}== step 5-6: upgrade${NC}"
+    echo -e "\n${CYAN}== upgrade${NC}"
     run dnf -y --refresh upgrade || die "dnf upgrade failed, node left drained"
     run dnf -y --setopt=installonly_limit=2 remove --oldinstallonly || echo "  no old kernels removed"
 
     nv=$(driver_inst)
 
-    echo -e "\n${CYAN}== step 8: pre-reboot gate${NC}"
+    echo -e "\n${CYAN}== before reboot: is the nvidia module ready?${NC}"
     k=$(kernels_installed | tail -n 1); gate=0
     ((DRY)) && echo "  (dry run: nothing was upgraded, this is the state as it is now)"
     st=$(dkms status -k "$k" 2>/dev/null | grep -E '^nvidia[/,]' | head -n 1)
@@ -982,16 +1026,16 @@ do_update() (
     ((gate == 0 || DRY)) || die "pre-reboot gate failed. Node stays drained, gpustack-worker restart=no. Fix it, reboot, then run --update again to verify and restore."
 
     need=0; why=()
-    needs-restarting -r >/dev/null 2>&1 || { need=1; why+=("needs-restarting -r"); }
+    needs-restarting -r >/dev/null 2>&1 || { need=1; why+=("updated kernel or core libraries"); }
     loaded=$(cat /sys/module/nvidia/version 2>/dev/null)
     [[ $loaded == "$nv" ]] || { need=1; why+=("driver ${loaded:-none} -> $nv"); }
     save kernel "$k"; save driver "$nv"; save since "$(date +%s)"; save boot_before "$(boot_id)"
     if ((need)); then
-        echo "reboot required: ${why[*]}"
-        ((DRY)) && { echo "DRY: ask 'Reboot $HOST now?', systemctl reboot; the next --update verifies, starts gpustack-worker, watches $WATCH_MIN min, restores restart=$wp"; exit 0; }
+        echo "  reboot needed: ${why[*]}"
+        ((DRY)) && { echo "  DRY: ask 'Reboot $HOST now?', systemctl reboot; after it, Update again verifies, starts GPUStack, watches $WATCH_MIN min"; exit 0; }
         ask "Reboot $HOST now?" || die "reboot declined. Node stays drained, gpustack-worker restart=no. Reboot later, then run --update again."
         save phase rebooting
-        log_info "when $HOST is back, run: sudo $SELF --update   (verify, start gpustack-worker, ${WATCH_MIN}-minute watch)"
+        log_info "when $HOST is back: sudo $SELF, choose Update (or: sudo $SELF --update) to finish"
         run systemctl reboot
         exit 0
     fi
@@ -1211,34 +1255,46 @@ do_status() {
 # =============================================================================
 # menu
 # =============================================================================
+sched_state() {
+    if [[ -e $CRON ]]; then echo "on, $SCHED_SHORT (cron)"
+    elif [[ -e $TIMER ]]; then echo "on, $SCHED_SHORT (systemd timer)"
+    else echo off; fi
+}
+
 menu() {
+    local c a upd
     while true; do
+        upd="remove version locks, drain GPUStack, upgrade, reboot"
+        echo
         echo -e "${BLUE}─────────────────────────────────────────────${NC}"
-        echo -e "${CYAN}        Rocky 9 GPU node — MENU${NC}"
+        echo -e "${CYAN}  $(hostname -s) — MENU${NC}"
         echo -e "${BLUE}─────────────────────────────────────────────${NC}"
-        echo "1. Bootstrap this node (driver, CUDA, docker)"
-        echo "2. Run maintenance now (clean + update)"
-        echo "3. Force maintenance (ignore the busy guard)"
-        echo "4. Dry run (print, change nothing)"
-        echo "5. Install schedule — cron"
-        echo "6. Install schedule — systemd timer"
-        echo "7. Remove schedule"
-        echo "8. Status"
-        echo -e "${RED}0. Exit${NC}"
-        echo -e "${BLUE}─────────────────────────────────────────────${NC}"
-        read -r -p "Choose an action [0-8]: " choice || break
-        case $choice in
-            1) echo -e "${YELLOW}→  Bootstrap${NC}";        bootstrap ;;
-            2) echo -e "${YELLOW}→  Maintenance${NC}";      maintenance; log_info "exit $?" ;;
-            3) echo -e "${YELLOW}→  Forced maintenance${NC}"; maintenance --force; log_info "exit $?" ;;
-            4) echo -e "${YELLOW}→  Dry run${NC}";          maintenance --dry-run; log_info "exit $?" ;;
-            5) echo -e "${YELLOW}→  Install (cron)${NC}";   do_install ;;
-            6) echo -e "${YELLOW}→  Install (timer)${NC}";  do_install --timer ;;
-            7) echo -e "${YELLOW}→  Remove schedule${NC}";  do_uninstall ;;
-            8) do_status ;;
-            0) echo -e "${GREEN}Bye.${NC}"; break ;;
+        if [[ -e $STATE_DIR/update.state ]]; then
+            echo -e "${YELLOW}  An update is unfinished, the node is drained. Choose 2 to finish it.${NC}"
+            upd="finish: verify, start GPUStack, watch $WATCH_MIN min"
+        fi
+        echo "  1) Check       health report, changes nothing"
+        echo "  2) Update      $upd"
+        echo "  3) Clean up    old kernels, caches, logs, unused containers"
+        echo "  4) Schedule    automatic maintenance: $(sched_state)"
+        echo "  5) Bootstrap   set up a new node (driver, CUDA, docker)"
+        echo -e "${RED}  0) Exit${NC}"
+        read -r -p "Choose [0-5]: " c || break
+        case $c in
+            1) do_check ;;
+            2) do_update ;;
+            3) maintenance --clean-only --force ;;
+            4) if [[ $(sched_state) == off ]]; then
+                   read -r -p "Turn on automatic maintenance ($SCHED_SHORT, includes dnf upgrade)? [Y/n] " a
+                   [[ $a == [nN]* ]] || do_install
+               else
+                   read -r -p "Turn off automatic maintenance? [Y/n] " a
+                   [[ $a == [nN]* ]] || do_uninstall
+               fi ;;
+            5) bootstrap ;;
+            0|q) echo -e "${GREEN}Bye.${NC}"; break ;;
             "") ;;
-            *) log_error "invalid choice, enter 0-8" ;;
+            *) log_error "enter 0-5" ;;
         esac
     done
 }

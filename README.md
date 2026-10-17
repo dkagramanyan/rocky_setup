@@ -44,7 +44,7 @@ current on a schedule, and gives you a menu when you run it with no arguments.
     chmod +x node-setup.sh
     ```
 
-3. Run it
+3. Run it, and pick from the menu
 
     ```bash
     sudo ./node-setup.sh
@@ -283,7 +283,7 @@ Never touched: crash dumps, irqbalance, BIOS and firmware, `crash-cleanup.*`,
 ## Commands and exit codes
 
 ```
-node-setup.sh                       interactive menu
+node-setup.sh                       menu: Check, Update, Clean up, Schedule, Bootstrap
 node-setup.sh --check               read-only report of this node (exit 1 on problems)
 node-setup.sh --update [--dry-run]  guarded update; run again after the reboot
 node-setup.sh bootstrap [stages]    base repos nouveau driver cuda toolkit docker firewall lock
@@ -354,31 +354,30 @@ Still tight? Set `MAINT_DROP_RESCUE=1` to drop the `0-rescue` image.
 ```
 ┌────────────────────────────────────────────┐
 │ ██████╗  ██████╗  ██████╗██╗  ██╗██╗   ██╗ │
-│ ██╔══██╗██╔═══██╗██╔════╝██║ ██╔╝╚██╗ ██╔╝ │
-│ ██████╔╝██║   ██║██║     █████╔╝  ╚████╔╝  │
-│ ██╔══██╗██║   ██║██║     ██╔═██╗   ╚██╔╝   │
-│ ██║  ██║╚██████╔╝╚██████╗██║  ██╗   ██║    │
-│ ╚═╝  ╚═╝ ╚═════╝  ╚═════╝╚═╝  ╚═╝   ╚═╝    │
+│ ...                                        │
 └────────────────────────────────────────────┘
-rocky9-gpu-node — provisioning and maintenance for Rocky Linux 9 GPU nodes
-Version: 2.0
-Schedule: every 2 weeks, Saturday 08:00 MSK (even ISO weeks)
-
 ─────────────────────────────────────────────
-        Rocky 9 GPU node — MENU
+  cn-002 — MENU
 ─────────────────────────────────────────────
-1. Bootstrap this node (driver, CUDA, docker)
-2. Run maintenance now (clean + update)
-3. Force maintenance (ignore the busy guard)
-4. Dry run (print, change nothing)
-5. Install schedule — cron
-6. Install schedule — systemd timer
-7. Remove schedule
-8. Status
-0. Exit
-─────────────────────────────────────────────
-Choose an action [0-8]:
+  1) Check       health report, changes nothing
+  2) Update      remove version locks, drain GPUStack, upgrade, reboot
+  3) Clean up    old kernels, caches, logs, unused containers
+  4) Schedule    automatic maintenance: off
+  5) Bootstrap   set up a new node (driver, CUDA, docker)
+  0) Exit
+Choose [0-5]:
 ```
+
+After the reboot of an update, the menu says so and item 2 becomes
+`finish: verify, start GPUStack, watch 15 min`.
+
+Every step prints one line. The command output (dnf transactions, DKMS
+builds, depmod) goes to the log only, and on a failure the last lines of the
+log are shown. Logs: `./reports/` for Check and Update,
+`/var/log/node-maintenance/` for Clean up and the schedule.
+
+The old menu entries are still commands: `maintenance [--dry-run|--force]`,
+`install [--timer]`, `uninstall`, `status`, `--update --dry-run`.
 
 ## Upgrading from v1
 
