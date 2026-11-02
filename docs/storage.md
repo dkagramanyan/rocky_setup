@@ -13,32 +13,26 @@ Current usage for reference:
 `/boot` is the pressure point. 960 MB with an NVIDIA initramfs holds two
 kernels, not the dnf default of three. See `MAINT_KEEP_KERNELS`.
 
-## Move the docker data root
+## Automatic mounting and Docker relocation
 
-```bash
-systemctl stop docker docker.socket containerd
-mkdir -p /home/docker-data
-# /etc/docker/daemon.json
-# { "data-root": "/home/docker-data" }
-rsync -aP /var/lib/docker/ /home/docker-data/
-systemctl start docker
-docker info | grep "Docker Root Dir"
-docker images        # sanity check before deleting anything
-rm -rf /var/lib/docker
-```
+Run `sudo ./node-setup.sh setup` for new-node provisioning, or
+`sudo ./node-setup.sh bootstrap disks docker` for the storage stages on an
+existing node (requires base packages). Completed stages have checkpoints under
+`/var/lib/node-setup/bootstrap`; remove the relevant checkpoint to repeat one.
 
-## Move containerd
+Existing local filesystems are mounted using their fstab destination or
+`/mnt/disks/<UUID>`. Blank disks are reported without formatting. See the README
+for exclusions. `/home` must be mounted separately before Docker migration.
 
-containerd has no data-root setting in this setup, so use a symlink:
-
-```bash
-systemctl stop docker docker.socket containerd
-mkdir -p /home/containerd-data
-rsync -aP /var/lib/containerd/ /home/containerd-data/
-rm -rf /var/lib/containerd
-ln -s /home/containerd-data /var/lib/containerd
-systemctl start containerd docker
-```
+Docker is installed from its RPM repository, including Compose and Buildx.
+Services stop before `rsync -aHAXS --numeric-ids` copies data. The script preserves
+existing daemon JSON settings and sets `data-root` to `/home/docker-data`.
+Containerd data is copied to `/home/containerd-data`; its original directory is
+renamed to `/var/lib/containerd.backup-<timestamp>` before creating the symlink.
+SELinux labels and systemd mount dependencies are configured before startup.
+Originals are retained; inspect `docker info`, `docker images`, and `docker ps -a`
+before manually removing them. Migration failures stop setup for a retry and
+never delete the original store. Custom containerd roots require manual migration.
 
 ## Move /opt/services
 
@@ -52,8 +46,7 @@ ln -s /home/services /opt/services
 `docker: Error response from daemon: unknown or invalid runtime name: nvidia`
 
 ```bash
-distribution=$(. /etc/os-release; echo $ID$VERSION_ID)
-curl -s -L https://nvidia.github.io/nvidia-container-toolkit/$distribution/nvidia-container-toolkit.repo \
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo \
   | tee /etc/yum.repos.d/nvidia-container-toolkit.repo
 dnf clean expire-cache && dnf install -y nvidia-container-toolkit
 nvidia-ctk runtime configure --runtime=docker

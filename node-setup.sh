@@ -5,6 +5,7 @@
 #>  Run with no arguments for the interactive menu.
 #>
 #>Commands
+#>  setup               provision a new node or update an existing node
 #>  bootstrap [stages]  provisioning: driver, CUDA, docker, firewall, versionlock
 #>  maintenance         clean + update now
 #>  install             deploy this script and the schedule (default: cron)
@@ -15,7 +16,7 @@
 #>  --update [--dry-run]
 #>                      guarded interactive update of this node: lock menu,
 #>                      drain, upgrade, pre-reboot gate, reboot. Run it again
-#>                      after the reboot to verify, start GPUStack and watch
+#>                      after the reboot to verify, start GPUStack and verify
 #>
 #>Maintenance options
 #>  --clean-only        no package upgrade
@@ -30,7 +31,7 @@
 #>Exit: 0 ok | 10 node busy | 20 partial failure | 30 already running
 set -uo pipefail
 
-VERSION="2.0"
+VERSION="2.1"
 SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "$0")"
 SETUP_URL="${SETUP_URL:-https://raw.githubusercontent.com/dkagramanyan/rocky_setup/main/node-setup.sh}"
 
@@ -48,7 +49,6 @@ CRASH_DIR=/var/crash
 VLOCK=/etc/dnf/plugins/versionlock.list
 CRASHDEBUG_CONF=/etc/sysctl.d/90-crashdebug.conf
 TIMER_SIG='__run_timers|enqueue_timer|timer.c:1686|vector_cleanup'
-WATCH_MIN=15
 
 # schedule: every second ISO week, Saturday 08:00 Europe/Moscow (GMT+3).
 # The "every second week" half is MAINT_BIWEEKLY inside the script, so cron and
@@ -122,7 +122,7 @@ maintenance() (
 
     # every second week: run only on even ISO weeks
     if ((SCHEDULED && MAINT_BIWEEKLY)); then
-        WEEK=$((10#$(date +%V)))
+        WEEK=$((10#$(TZ="$SCHED_CRON_TZ" date +%V)))
         ((WEEK % 2 == 0)) || { echo "biweekly: ISO week $WEEK is odd, nothing to do"; exit 0; }
     fi
 
@@ -361,121 +361,278 @@ node_busy() {
 }
 
 # =============================================================================
-# bootstrap — one-shot provisioning of a fresh node. Reboots twice: after the
-# nouveau blacklist and after the driver install. Re-run after each reboot, it
-# skips completed stages.
-# =============================================================================
+# Storage: mount existing local filesystems only; never partition or format.
+mount_disks() {
+    python3 - <<'PYDISKS'
+import json, os, pathlib, re, subprocess
+
+def run(*args, **kwargs):
+    return subprocess.run(args, check=True, text=True, **kwargs)
+def output(*args):
+    return run(*args, stdout=subprocess.PIPE).stdout.strip()
+
+devices = json.loads(output('lsblk', '--json', '--paths', '--output',
+    'NAME,TYPE,FSTYPE,UUID,MOUNTPOINTS,RO,RM'))['blockdevices']
+leaves = {}
+def walk(items, removable=False):
+    for d in items:
+        removable_here = removable or bool(d.get('rm'))
+        if d.get('children'):
+            walk(d['children'], removable_here)
+        elif not removable_here:
+            leaves[d['name']] = d
+walk(devices)
+fstab = pathlib.Path('/etc/fstab')
+original = fstab.read_text()
+backed_up = False
+for dev, d in leaves.items():
+    if d['type'] not in ('disk', 'part', 'lvm', 'crypt', 'raid0', 'raid1', 'raid5', 'raid6', 'raid10'):
+        continue
+    if d.get('ro') or any(d.get('mountpoints') or []):
+        continue
+    fs, uuid = d.get('fstype'), d.get('uuid')
+    if fs not in ('xfs', 'ext4', 'ext3', 'ext2', 'btrfs') or not uuid:
+        print(f'SKIP {dev}: {fs or "no filesystem"}; no formatting or unlocking performed')
+        continue
+    if not re.fullmatch(r'[A-Za-z0-9-]+', uuid):
+        raise SystemExit(f'Unexpected UUID for {dev}')
+    matches = output('blkid', '-t', f'UUID={uuid}', '-o', 'device').splitlines()
+    if len(matches) != 1:
+        raise SystemExit(f'Ambiguous UUID {uuid}: {matches}')
+    configured = subprocess.run(['findmnt', '--fstab', '--evaluate', '--source', dev,
+        '--noheadings', '--output', 'TARGET,OPTIONS'], text=True, stdout=subprocess.PIPE)
+    if configured.returncode not in (0, 1):
+        raise SystemExit(f'Cannot inspect fstab for {dev}')
+    if configured.stdout.strip():
+        # Respect existing mount destinations and noauto entries.
+        for line in configured.stdout.splitlines():
+            target, options = line.split(None, 1)
+            if 'noauto' in options.split(','):
+                print(f'SKIP {dev}: noauto in fstab')
+                continue
+            run('mount', '--', target)
+        continue
+    target = pathlib.Path('/mnt/disks') / uuid
+    target.mkdir(parents=True, exist_ok=True)
+    if target.is_symlink() or os.path.ismount(target) or any(target.iterdir()):
+        raise SystemExit(f'Refusing to hide existing data at {target}')
+    run('mount', '-t', fs, '-o', 'defaults,nodev,nosuid', '--', dev, str(target))
+    if not backed_up:
+        import time
+        backup = fstab.with_name(f'fstab.node-setup-{time.time_ns()}.bak')
+        backup.write_text(original)
+        backed_up = True
+    with fstab.open('a') as f:
+        f.write(f'\nUUID={uuid} {target} {fs} defaults,nodev,nosuid,nofail,x-systemd.device-timeout=10s 0 {0 if fs in ("xfs", "btrfs") else 2}\n')
+    print(f'Mounted {dev} at {target}; persisted by UUID')
+run('systemctl', 'daemon-reload')
+PYDISKS
+}
+
+# Copy first; keep originals for operator verification and recovery.
+setup_docker() {
+    dnf install -y dnf-plugins-core rsync python3 policycoreutils-python-utils
+    dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+    dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    local source_root target stamp containerd_root
+    containerd_root=$(containerd config dump | sed -n "s/^root = [\"']\\(.*\\)[\"']/\\1/p")
+    [[ $containerd_root == /var/lib/containerd ]] || { log_error "Custom containerd root $containerd_root: migrate it explicitly before continuing"; return 1; }
+    source_root=$(python3 - <<'PYROOT'
+import json, pathlib
+p = pathlib.Path('/etc/docker/daemon.json')
+d = json.loads(p.read_text()) if p.exists() else {}
+print(d.get('data-root', '/var/lib/docker'))
+PYROOT
+    )
+    if systemctl is-active --quiet docker; then
+        source_root=$(docker info -f '{{.DockerRootDir}}')
+        if [[ $(docker info -f '{{.LiveRestoreEnabled}}') == true && -n $(docker ps -q) ]]; then
+            log_error 'Stop running containers before migrating a daemon with live-restore enabled'; return 1
+        fi
+    fi
+    # Reject overlapping roots and paths unsafe for systemd/fstab configuration.
+    python3 - "$source_root" "$DOCKER_DATA_ROOT" "$CONTAINERD_DATA_ROOT" <<'PYPATH'
+import pathlib, re, sys
+if any(not pathlib.Path(p).is_absolute() for p in sys.argv[1:]):
+    raise SystemExit("Storage roots must be absolute")
+src, docker, containerd = [pathlib.Path(p).resolve() for p in sys.argv[1:]]
+for p in (src, docker, containerd):
+    if not str(p).startswith('/') or not re.fullmatch(r'/[A-Za-z0-9_./-]+', str(p)) or str(p) in ('/', '/home', '/var', '/var/lib'):
+        raise SystemExit(f'Unsafe storage root: {p}')
+for a, b in ((src, docker), (docker, containerd), (src, containerd)):
+    if a != b and (a in b.parents or b in a.parents):
+        raise SystemExit(f'Overlapping storage roots: {a}, {b}')
+if containerd == pathlib.Path('/var/lib/containerd') or docker == pathlib.Path('/var/lib/containerd'):
+    raise SystemExit('Choose a destination outside /var/lib/containerd')
+if docker == containerd:
+    raise SystemExit('Docker and containerd must use different directories')
+PYPATH
+    # /home must actually be mounted: do not fill the small root filesystem.
+    if [[ $DOCKER_DATA_ROOT == /home/* || $CONTAINERD_DATA_ROOT == /home/* ]]; then
+        mountpoint -q /home || { log_error '/home is not a separate mounted filesystem'; return 1; }
+    fi
+    # Refuse to merge unrelated stores; a marker allows retry after a partial copy.
+    mkdir -p "$STATE_DIR/migrations"
+    for target in "$DOCKER_DATA_ROOT" "$CONTAINERD_DATA_ROOT"; do
+        local origin marker
+        origin=$source_root
+        [[ $target != "$CONTAINERD_DATA_ROOT" ]] || origin=/var/lib/containerd
+        [[ $(readlink -m "$origin") != "$(readlink -m "$target")" ]] || continue
+        marker="$STATE_DIR/migrations/$(printf '%s' "$target" | sha256sum | cut -d' ' -f1)"
+        if [[ -f $marker ]]; then
+            [[ $(cat "$marker") == "$origin" ]] || { log_error "Migration source changed for $target"; return 1; }
+        else
+            [[ ! -d $target || -z $(find "$target" -mindepth 1 -maxdepth 1 -print -quit) ]] || { log_error "Destination is not empty: $target"; return 1; }
+            printf '%s\n' "$origin" > "$marker"
+        fi
+    done
+    systemctl stop docker.service docker.socket containerd.service
+    for target in "$DOCKER_DATA_ROOT" "$CONTAINERD_DATA_ROOT"; do mkdir -p "$target"; done
+    if [[ $(readlink -m "$source_root") != "$(readlink -m "$DOCKER_DATA_ROOT")" ]]; then
+        [[ ! -d $source_root ]] || rsync -aHAXS --numeric-ids "$source_root/" "$DOCKER_DATA_ROOT/"
+    fi
+    if [[ $(readlink -m /var/lib/containerd) != "$(readlink -m "$CONTAINERD_DATA_ROOT")" ]]; then
+        [[ ! -d /var/lib/containerd ]] || rsync -aHAXS --numeric-ids /var/lib/containerd/ "$CONTAINERD_DATA_ROOT/"
+        stamp=$(date +%Y%m%d-%H%M%S)-$$
+        if [[ -e /var/lib/containerd || -L /var/lib/containerd ]]; then
+            mv /var/lib/containerd "/var/lib/containerd.backup-$stamp"
+        fi
+        ln -s "$CONTAINERD_DATA_ROOT" /var/lib/containerd
+    fi
+    mkdir -p /etc/docker
+    [[ ! -f /etc/docker/daemon.json ]] || cp -a /etc/docker/daemon.json "/etc/docker/daemon.json.bak-$(date +%s)-$$"
+    python3 - "$DOCKER_DATA_ROOT" <<'PYJSON'
+import json, pathlib, sys
+p = pathlib.Path('/etc/docker/daemon.json')
+d = json.loads(p.read_text()) if p.exists() else {}
+d['data-root'] = sys.argv[1]
+tmp = p.with_suffix('.json.tmp')
+tmp.write_text(json.dumps(d, indent=2) + '\n')
+tmp.replace(p)
+PYJSON
+    if selinuxenabled; then
+        [[ $DOCKER_DATA_ROOT == /var/lib/docker ]] || semanage fcontext -a -e /var/lib/docker "$DOCKER_DATA_ROOT" 2>/dev/null || semanage fcontext -m -e /var/lib/docker "$DOCKER_DATA_ROOT"
+        semanage fcontext -a -e /var/lib/containerd "$CONTAINERD_DATA_ROOT" 2>/dev/null || semanage fcontext -m -e /var/lib/containerd "$CONTAINERD_DATA_ROOT"
+        restorecon -RF "$DOCKER_DATA_ROOT" "$CONTAINERD_DATA_ROOT"
+    fi
+    for target in docker containerd; do
+        mkdir -p "/etc/systemd/system/$target.service.d"
+        printf '[Unit]\nRequiresMountsFor=%s %s\n' "$DOCKER_DATA_ROOT" "$CONTAINERD_DATA_ROOT" > "/etc/systemd/system/$target.service.d/storage.conf"
+    done
+    curl -fsSL https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo -o /etc/yum.repos.d/nvidia-container-toolkit.repo
+    dnf install -y nvidia-container-toolkit
+    nvidia-ctk runtime configure --runtime=docker
+    dockerd --validate --config-file=/etc/docker/daemon.json
+    systemctl daemon-reload
+    systemctl enable --now containerd docker
+    [[ $(docker info -f '{{.DockerRootDir}}') == "$DOCKER_DATA_ROOT" ]] || { log_error 'Docker data-root verification failed'; return 1; }
+    log_success "Docker uses $DOCKER_DATA_ROOT; containerd uses $CONTAINERD_DATA_ROOT"
+    log_warning 'Original data retained. Check docker images and containers before removing backups.'
+}
+
+# New-node update + provisioning, checkpointed across required reboots.
 bootstrap() (
     set -e
     require_root
-    stages="${*:-base repos nouveau driver cuda toolkit docker firewall lock}"
-    say()  { printf '\n=== %s ===\n' "$*"; }
-    have() { [[ " $stages " == *" $1 "* ]]; }
-
-    have base && { say "base packages"
-        dnf upgrade --refresh -y
-        dnf install -y epel-release dnf-utils dnf-plugin-versionlock rsync
-        dnf groupinstall -y "Development Tools"
-        dnf install -y "kernel-devel-$(uname -r)" "kernel-headers-$(uname -r)" \
-                       dkms elfutils-libelf-devel libglvnd-devel
-    }
-
-    have repos && { say "repositories"
+    exec 9>/var/lock/node-maintenance.lock
+    flock -n 9 || { log_error 'another setup/update/maintenance is running'; exit 30; }
+    [[ ! -e $STATE_DIR/update.state ]] || { log_error 'Finish the pending --update first'; exit 1; }
+    # shellcheck source=/dev/null
+    . /etc/os-release
+    [[ ${VERSION_ID%%.*} == 9 && $(uname -m) == x86_64 ]] || { log_error 'Requires EL9 x86_64'; exit 1; }
+    stages="${*:-base disks repos nouveau driver cuda docker firewall toolkit}"
+    for stage in $stages; do
+        case $stage in base|disks|repos|nouveau|driver|cuda|docker|firewall|toolkit|lock) ;;
+            *) log_error "unknown stage: $stage"; exit 2 ;;
+        esac
+    done
+    mkdir -p "$STATE_DIR/bootstrap"
+    touch "$STATE_DIR/bootstrap.pending"
+    say() { printf '\n=== %s ===\n' "$*"; }
+    have() { [[ " $stages " == *" $1 "* && ! -f $STATE_DIR/bootstrap/$1 ]]; }
+    done_stage() { touch "$STATE_DIR/bootstrap/$1"; }
+    reboot_needed() { log_warning 'Reboot the node, then run node-setup.sh setup again to resume'; exit 0; }
+    have base && { say 'base update'
+        dnf install -y epel-release dnf-plugins-core python3-dnf-plugin-versionlock rsync python3 pciutils mokutil util-linux curl
         dnf config-manager --set-enabled crb
-        dnf config-manager --add-repo \
-            https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
-        dnf clean all && dnf makecache
+        dnf -y --setopt=installonly_limit=2 remove --oldinstallonly
+        dnf upgrade --refresh -y
+        done_stage base
     }
-
-    have nouveau && { say "nouveau blacklist"
-        lspci | grep -i nvidia || { log_error "no NVIDIA device on the PCI bus"; exit 1; }
-        if lsmod | grep -q '^nouveau'; then
-            grubby --args="rd.driver.blacklist=nouveau nouveau.modeset=0" --update-kernel=ALL
-            dracut --force
-            log_warning "REBOOT NOW, then run bootstrap again"; exit 0
+    # Do not request headers for an obsolete running kernel after upgrading.
+    [[ $(uname -r) == "$(kernels_installed | tail -n 1)" ]] || reboot_needed
+    have disks && { say 'mount local filesystems'; mount_disks; done_stage disks; }
+    have repos && { say 'repositories and build dependencies'
+        dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
+        dnf groupinstall -y 'Development Tools'
+        dnf install -y "kernel-devel-$(uname -r)" kernel-headers dkms elfutils-libelf-devel libglvnd-devel
+        done_stage repos
+    }
+    have nouveau && { say 'nouveau blacklist'
+        lspci | grep -i nvidia || { log_error 'No NVIDIA GPU'; exit 1; }
+        if mokutil --sb-state 2>/dev/null | grep -qi enabled; then
+            log_error 'Secure Boot is enabled; configure module signing or disable it before setup'; exit 1
         fi
-        log_success "nouveau not loaded"
+        printf 'blacklist nouveau\noptions nouveau modeset=0\n' > /etc/modprobe.d/blacklist-nouveau.conf
+        grubby --args='rd.driver.blacklist=nouveau nouveau.modeset=0' --update-kernel=ALL
+        dracut --force
+        done_stage nouveau
     }
-
+    if [[ " $stages " == *' driver '* ]] && lsmod | grep '^nouveau' >/dev/null; then reboot_needed; fi
     have driver && { say "NVIDIA driver ($DRIVER_STREAM)"
-        # ELRepo packages conflict with the CUDA-repo module stream
-        dnf remove -y 'kmod-nvidia*' 'nvidia-x11-drv*' 2>/dev/null || true
-        dnf module reset  -y nvidia-driver
-        dnf module enable -y "$DRIVER_STREAM"
+        # Only ELRepo conflicts; never remove the open DKMS driver on resume.
+        dnf remove -y kmod-nvidia 'nvidia-x11-drv*'
+        dnf module reset -y nvidia-driver
         dnf module install -y "$DRIVER_STREAM"
-        mokutil --sb-state 2>/dev/null | grep -qi enabled \
-            && log_warning "Secure Boot is on, unsigned modules will not load"
-        log_warning "REBOOT NOW, then run bootstrap again"
+        done_stage driver
     }
-
-    have cuda && { say "CUDA toolkit"
+    have cuda && { say 'CUDA toolkit'
         dnf install -y cuda-toolkit
         cat > /etc/profile.d/cuda.sh <<'EOF'
 export CUDA_HOME=/usr/local/cuda
 export PATH=$CUDA_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
 EOF
-        chmod 0644 /etc/profile.d/cuda.sh
+        done_stage cuda
     }
-
-    have toolkit && { say "verification"
-        modinfo nvidia | awk '/^license:/{print "module license: "$2"  (expect GPL for open modules)"}'
-        nvidia-smi || log_error "nvidia-smi failed, check: dmesg | grep -E 'NVRM|nvidia'"
-        /usr/local/cuda/bin/nvcc --version || true
-    }
-
-    have docker && { say "docker on /home"
-        if command -v docker >/dev/null; then
-            if [[ $(docker info -f '{{.DockerRootDir}}' 2>/dev/null) != "$DOCKER_DATA_ROOT" ]]; then
-                systemctl stop docker docker.socket containerd || true
-                mkdir -p "$DOCKER_DATA_ROOT" "$CONTAINERD_DATA_ROOT"
-                rsync -a /var/lib/docker/ "$DOCKER_DATA_ROOT/"
-                rsync -a /var/lib/containerd/ "$CONTAINERD_DATA_ROOT/"
-                mkdir -p /etc/docker
-                python3 - "$DOCKER_DATA_ROOT" <<'EOF'
-import json, sys, pathlib
-p = pathlib.Path("/etc/docker/daemon.json")
-d = json.loads(p.read_text()) if p.exists() and p.read_text().strip() else {}
-d["data-root"] = sys.argv[1]
-p.write_text(json.dumps(d, indent=2) + "\n")
-EOF
-                rm -rf /var/lib/containerd && ln -sfn "$CONTAINERD_DATA_ROOT" /var/lib/containerd
-                systemctl start containerd docker
-                log_warning "old data left in /var/lib/docker, remove it once 'docker images' looks right"
-            fi
-            # shellcheck source=/dev/null
-            distribution=$(. /etc/os-release; echo "$ID$VERSION_ID")
-            curl -fsSL "https://nvidia.github.io/nvidia-container-toolkit/$distribution/nvidia-container-toolkit.repo" \
-                -o /etc/yum.repos.d/nvidia-container-toolkit.repo
-            dnf clean expire-cache && dnf install -y nvidia-container-toolkit
-            nvidia-ctk runtime configure --runtime=docker
-            systemctl restart docker
-            docker run --rm --gpus all nvidia/cuda:12.4.0-base-rockylinux9 nvidia-smi || true
-        else
-            log_warning "docker not installed, skipping"
+    have docker && { say 'Docker installation and storage'; setup_docker; done_stage docker; }
+    have firewall && { say 'firewall policy'
+        if ((MAINT_DISABLE_FIREWALL)); then
+            systemctl disable --now firewalld 2>/dev/null || true
+            systemctl mask firewalld
         fi
+        done_stage firewall
     }
-
-    have firewall && { say "firewalld off"
-        systemctl disable --now firewalld 2>/dev/null || true
-        systemctl mask firewalld 2>/dev/null || true
-        log_info "firewalld: $(systemctl is-enabled firewalld 2>&1) / $(systemctl is-active firewalld 2>&1)"
+    have lock && { dnf versionlock add 'nvidia*' 'cuda*' 'kmod-nvidia*'; done_stage lock; }
+    have toolkit && { say 'verify GPU and CUDA'
+        if [[ $(cat /sys/module/nvidia/version 2>/dev/null || true) != "$(modinfo -F version nvidia)" ]]; then reboot_needed; fi
+        nvidia-smi
+        /usr/local/cuda/bin/nvcc --version
+        done_stage toolkit
     }
-
-    have lock && { say "versionlock"
-        dnf versionlock add 'nvidia-driver*' 'cuda*' 'kmod-nvidia*' || true
-        dnf versionlock list
-        log_info "mirror this in MAINT_EXCLUDE_PKGS in $CONF"
-    }
-
-    say "done"
+    rm -f "$STATE_DIR/bootstrap.pending"
+    say 'setup complete'
 )
+
+setup_or_update() {
+    local arg
+    for arg in "$@"; do
+        case $arg in --dry-run|--update) ;; *) log_error "unknown option: $arg"; return 2 ;; esac
+    done
+    if [[ -e $STATE_DIR/update.state ]]; then do_update "$@"
+    elif [[ -e $STATE_DIR/bootstrap.pending ]] || ! command -v nvidia-smi >/dev/null; then
+        if [[ " $* " == *' --dry-run '* ]]; then
+            log_info 'New node: setup will update packages, mount filesystems, install NVIDIA/CUDA/Docker and move storage to /home; no changes made'
+        else bootstrap; fi
+    else do_update "$@"
+    fi
+}
 
 # =============================================================================
 # --check / --update — run on each node with sudo. Version locks are made
 # visible, the update drains GPUStack, gates the reboot on a built nvidia
-# module and keeps gpustack-worker from auto-starting until the node has
-# survived a watch window. Background: cn-002 crash-looped on a versionlocked
+# module and keeps gpustack-worker from auto-starting until verification.
+# Background: cn-002 crash-looped on a versionlocked
 # 610.57.04 driver that the routine dnf upgrade skipped for two months.
 # =============================================================================
 
@@ -873,7 +1030,7 @@ do_update() (
 
     # steps 10-12
     update_finish() {
-        local k nv smi irq n fails=0 models left t
+        local k nv smi irq n fails=0 models left
         if [[ $(kvg "$ST" phase) == watch && $(kvg "$ST" boot_watch) != "$(boot_id)" ]]; then
             die "$HOST rebooted during the watch window (crash?). gpustack-worker restart policy is still 'no'. Look at $CRASH_DIR; remove $ST once resolved."
         fi
@@ -906,16 +1063,10 @@ do_update() (
             echo "  gpustack-worker was '$(kvg "$ST" worker)' before the update, not starting it"
         fi
 
-        # restart=no stays until the node has survived the window, so a crash
-        # in it cannot turn into a boot loop
-        echo -e "\n${CYAN}== watch $WATCH_MIN min for crashes${NC}"
-        save phase watch; save boot_watch "$(boot_id)"; t=$(date +%s)
-        for ((n = WATCH_MIN; n > 0; n -= 5)); do
-            echo "  $n min left"; sleep $(( (n < 5 ? n : 5) * 60 ))
-        done
-        n=$(dumps_since "$t")
-        chk "$n new crash dumps during the watch" test "$n" -eq 0 || die "crash dump during the watch window, restart policy stays 'no'"
-        chk "kdump still armed" test "$(cat /sys/kernel/kexec_crash_loaded 2>/dev/null)" = 1 || die "kdump disarmed during the watch"
+        # Immediate post-start checks; no fixed 15-minute watch.
+        n=$(dumps_since "$(kvg "$ST" since)")
+        chk "$n new crash dumps since update started" test "$n" -eq 0 || die "new crash dump; restart policy stays no"
+        chk "kdump still armed" test "$(cat /sys/kernel/kexec_crash_loaded 2>/dev/null)" = 1 || die "kdump disarmed"
 
         [[ $(kvg "$ST" worker) == absent ]] || run docker update --restart="$(kvg "$ST" worker_policy)" gpustack-worker \
             || die "cannot restore restart=$(kvg "$ST" worker_policy)"
@@ -928,6 +1079,10 @@ do_update() (
     if [[ -e $ST ]]; then
         log_info "unfinished update from $(kvg "$ST" started), resuming at verification"
         ((DRY)) && { sed 's/^/  /' "$ST"; exit 0; }
+        case $(kvg "$ST" phase) in
+            ready|rebooting|watch) ;;
+            *) die 'Previous update stopped before the pre-reboot gate. Resolve the failed transaction and module checks before restoring workloads; see README recovery instructions.' ;;
+        esac
         update_finish; exit $?
     fi
     # dumps newer than the last --check count as new; without one, the last 7 days
@@ -993,6 +1148,7 @@ do_update() (
         [[ $(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$m" 2>/dev/null) == always ]] \
             && log_warning "$m has restart=always and will start on boot by itself"
     done
+    save since "$(date +%s)"
     save started "$(date '+%F %T')"; save phase drained; save irq_before "$(irq_state)"
     save worker "$ws"; save worker_policy "$wp"; save models "$models"
     [[ $ws != running ]] || run docker stop gpustack-worker || die "cannot stop gpustack-worker"
@@ -1018,7 +1174,7 @@ do_update() (
     ((DRY)) && echo "  (dry run: nothing was upgraded, this is the state as it is now)"
     st=$(dkms status -k "$k" 2>/dev/null | grep -E '^nvidia[/,]' | head -n 1)
     chk "dkms status -k $k: ${st:-no nvidia entry}" grep -q ': installed' <<<"$st" || gate=1
-    chk "/lib/modules/$k/extra/nvidia.ko.xz" test -e "/lib/modules/$k/extra/nvidia.ko.xz" || gate=1
+    chk "NVIDIA module available for $k" modinfo -k "$k" -F filename nvidia || gate=1
     mv=$(modinfo -k "$k" -F version nvidia 2>/dev/null)
     chk "module version ${mv:-none}, installed driver $nv" test "$mv" = "$nv" || gate=1
     dk=$(grubby --default-kernel 2>/dev/null)
@@ -1029,17 +1185,17 @@ do_update() (
     needs-restarting -r >/dev/null 2>&1 || { need=1; why+=("updated kernel or core libraries"); }
     loaded=$(cat /sys/module/nvidia/version 2>/dev/null)
     [[ $loaded == "$nv" ]] || { need=1; why+=("driver ${loaded:-none} -> $nv"); }
-    save kernel "$k"; save driver "$nv"; save since "$(date +%s)"; save boot_before "$(boot_id)"
+    save phase ready; save kernel "$k"; save driver "$nv"; save boot_before "$(boot_id)"
     if ((need)); then
         echo "  reboot needed: ${why[*]}"
-        ((DRY)) && { echo "  DRY: ask 'Reboot $HOST now?', systemctl reboot; after it, Update again verifies, starts GPUStack, watches $WATCH_MIN min"; exit 0; }
+        ((DRY)) && { echo "  DRY: ask 'Reboot $HOST now?', systemctl reboot; after it, Update again verifies, starts GPUStack, restores restart policy"; exit 0; }
         ask "Reboot $HOST now?" || die "reboot declined. Node stays drained, gpustack-worker restart=no. Reboot later, then run --update again."
         save phase rebooting
         log_info "when $HOST is back: sudo $SELF, choose Update (or: sudo $SELF --update) to finish"
         run systemctl reboot
         exit 0
     fi
-    ((DRY)) && { echo "DRY: no reboot needed now; next: verify, start gpustack-worker, watch $WATCH_MIN min, restore restart policy"; exit 0; }
+    ((DRY)) && { echo "DRY: no reboot needed now; next: verify, start gpustack-worker, restore restart policy"; exit 0; }
     update_finish
 )
 
@@ -1264,25 +1420,24 @@ sched_state() {
 menu() {
     local c a upd
     while true; do
-        upd="remove version locks, drain GPUStack, upgrade, reboot"
+        upd="new node: provision; existing node: guarded update"
         echo
         echo -e "${BLUE}─────────────────────────────────────────────${NC}"
         echo -e "${CYAN}  $(hostname -s) — MENU${NC}"
         echo -e "${BLUE}─────────────────────────────────────────────${NC}"
         if [[ -e $STATE_DIR/update.state ]]; then
             echo -e "${YELLOW}  An update is unfinished, the node is drained. Choose 2 to finish it.${NC}"
-            upd="finish: verify, start GPUStack, watch $WATCH_MIN min"
+            upd="finish: verify, start GPUStack, restore restart policy"
         fi
         echo "  1) Check       health report, changes nothing"
-        echo "  2) Update      $upd"
+        echo "  2) Setup / Update  $upd"
         echo "  3) Clean up    old kernels, caches, logs, unused containers"
         echo "  4) Schedule    automatic maintenance: $(sched_state)"
-        echo "  5) Bootstrap   set up a new node (driver, CUDA, docker)"
         echo -e "${RED}  0) Exit${NC}"
-        read -r -p "Choose [0-5]: " c || break
+        read -r -p "Choose [0-4]: " c || break
         case $c in
             1) do_check ;;
-            2) do_update ;;
+            2) setup_or_update ;;
             3) maintenance --clean-only --force ;;
             4) if [[ $(sched_state) == off ]]; then
                    read -r -p "Turn on automatic maintenance ($SCHED_SHORT, includes dnf upgrade)? [Y/n] " a
@@ -1291,10 +1446,9 @@ menu() {
                    read -r -p "Turn off automatic maintenance? [Y/n] " a
                    [[ $a == [nN]* ]] || do_uninstall
                fi ;;
-            5) bootstrap ;;
             0|q) echo -e "${GREEN}Bye.${NC}"; break ;;
             "") ;;
-            *) log_error "enter 0-5" ;;
+            *) log_error "enter 0-4" ;;
         esac
     done
 }
@@ -1304,6 +1458,7 @@ menu() {
 # =============================================================================
 case "${1:-}" in
     -h|--help)   sed -n 's/^#>//p' "$SELF" 2>/dev/null || sed -n 's/^#>//p' "$0"; exit 0 ;;
+    setup)       shift; setup_or_update "$@" ;;
     bootstrap)   shift; banner; bootstrap "$@" ;;
     maintenance) shift; maintenance "$@"; exit $? ;;
     install)     shift; banner; do_install "$@" ;;
