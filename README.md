@@ -7,9 +7,10 @@ current on a schedule, and gives you a menu when you run it with no arguments.
 
 ## What it does
 
-- **Bootstrap** a fresh node: NVIDIA driver (open DKMS modules), CUDA toolkit,
+- **Setup / Update** provisions a fresh node (including the base OS update),
+  mounts existing data filesystems by UUID, and resumes completed stages after reboot: NVIDIA driver (open DKMS modules), CUDA toolkit,
   docker relocated to `/home`, nvidia-container-toolkit, firewalld off,
-  versionlock on the NVIDIA stack.
+  optional versionlock on the NVIDIA stack (`bootstrap lock`).
 - **Maintenance**, unattended: kernel pruning before the upgrade so `/boot` has
   room for the new initramfs, `dnf upgrade` with your excludes, journal vacuum,
   rotated logs, core dumps, `/tmp` and `/var/tmp` by atime, pip/uv/npm caches,
@@ -59,11 +60,49 @@ current on a schedule, and gives you a menu when you run it with no arguments.
 Non-interactive, for a fleet:
 
 ```bash
-sudo ./node-setup.sh bootstrap             # new node, reboots twice, re-run after each
+sudo ./node-setup.sh setup                 # new or existing node; re-run after requested reboot
 sudo ./node-setup.sh install               # cron, every 2 weeks Sat 08:00 MSK
 sudo ./node-setup.sh install --timer       # systemd timer instead
 sudo ./node-setup.sh maintenance --dry-run # verify, change nothing
 ```
+
+
+## New-node setup and disks
+
+`sudo ./node-setup.sh setup` combines the OS update and bootstrap. It selects
+provisioning when NVIDIA tools are absent or setup is unfinished; otherwise it
+selects the guarded update. Use `bootstrap` explicitly to provision an existing
+GPU node missing Docker. Successful stages are recorded in
+`/var/lib/node-setup/bootstrap/`; errors stop setup and the next run retries the
+failed stage. When a reboot is required, the script exits with instructions;
+reboot manually and run `setup` again. It does not reboot automatically.
+To deliberately repeat a completed stage, remove its matching checkpoint file
+and run `bootstrap <stage>`. Partial stage runs require their prerequisites.
+
+The `disks` stage discovers unmounted local XFS, ext2/3/4 and Btrfs filesystems,
+including active LVM, RAID and unlocked encrypted volumes. Existing fstab entries
+keep their destinations and `noauto` policy. New mounts use `/mnt/disks/<UUID>`
+and persistent UUID entries with `nofail`; the original fstab is backed up.
+Mounted filesystems, removable/read-only media, swap, encrypted containers,
+RAID/LVM member devices and blank disks are left untouched. Duplicate UUIDs
+stop setup rather than selecting an arbitrary disk. Blank disks need explicit
+partitioning/formatting before they can be mounted; this script never erases them.
+
+Docker Engine, Buildx, Compose and NVIDIA Container Toolkit are installed.
+Docker data goes to `/home/docker-data`, containerd to `/home/containerd-data`.
+`/home` must be a separate mounted filesystem. Configure `DOCKER_DATA_ROOT` and
+`CONTAINERD_DATA_ROOT` in `/etc/sysconfig/node-maintenance` for another layout.
+Migration stops the services, preserves ownership, hard links, ACLs, xattrs and
+sparse files, retains originals, applies SELinux labels and adds systemd mount
+dependencies. An unrelated nonempty destination or custom containerd root stops
+the migration for manual review. A failed migration leaves services stopped;
+fix the reported error and rerun the stage. Keep enough free space for the copy.
+Verify images and containers before manually deleting the original Docker data
+and `/var/lib/containerd.backup-*`.
+
+Installation follows the [Docker RPM instructions](https://docs.docker.com/engine/install/centos/)
+and [NVIDIA toolkit instructions](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+Docker's data-root alone does not move [containerd image storage](https://docs.docker.com/engine/storage/containerd/).
 
 ## Schedule
 
@@ -145,11 +184,12 @@ timer is firing into nothing.
 ## Check and update a GPU node (`--check`, `--update`)
 
 Run these on each node, from the repository clone, with sudo. One node at a
-time: finish a node (including its watch window) before starting the next.
+time: finish verification on a node before starting the next. There is no fixed
+15-minute watch period.
 
 ```bash
 sudo ./node-setup.sh --update             # update everything, press Enter at each question
-sudo ./node-setup.sh --update             # again after the reboot: verify, start GPUStack, watch
+sudo ./node-setup.sh --update             # again after the reboot: verify, start GPUStack, restore restart policy
 sudo ./node-setup.sh --check              # read-only report, exit 1 on any problem
 sudo ./node-setup.sh --update --dry-run   # print every change, make none
 ```
@@ -253,7 +293,7 @@ hold something back, so the drift shows up in its log and mail.
 6. `dnf -y --setopt=installonly_limit=2 remove --oldinstallonly`
 7. (Locks you chose to keep stay as they are. Nothing is re-locked.)
 8. **Pre-reboot gate** for the newest kernel: `dkms status -k` says
-   `installed`, `extra/nvidia.ko.xz` exists, its version is the installed
+   `installed`, `modinfo` resolves the module (any supported compression/location), its version is the installed
    driver, and `grubby --default-kernel` points at it. If anything fails, it
    does not reboot and leaves the node drained.
 9. If `needs-restarting -r` or the driver change requires it, asks
@@ -267,13 +307,16 @@ that file exists the node stays drained with `restart=no`, and the next
     installed driver, irqbalance is unchanged, kdump is armed, and there is no
     new crash dump.
 11. Starts `gpustack-worker` and waits up to 10 min for the model containers.
-12. Watches for 15 min, then checks for new crash dumps and kdump again.
-    Only then does it restore the old restart policy. A crash in the window
-    therefore cannot turn into a boot loop. If the node rebooted during the
-    window, the next `--update` says so and leaves the policy at `no`.
+12. Immediately rechecks crash dumps and kdump, then restores the old restart
+    policy. There is no 15-minute sleep. Readiness polling remains: up to 3 min
+    for kdump and 10 min for previously running model containers, ending early
+    once ready. Legacy unfinished watch states still detect an intervening reboot.
 
-Any failed step stops the update with the node drained. Fix the cause, then
-run `--update` again. To abandon an unfinished update, remove
+Any failed step stops the update with the node drained. If the phase is `ready` or `rebooting`, fix the cause and run `--update` again.
+If the transaction stopped in `drained`, automatic resume refuses to restore
+workloads: repair the DNF transaction, verify DKMS/module version and the default
+kernel as described above, reboot if needed, then append `phase=ready` to
+`/var/lib/node-setup/update.state` and run `--update` to verify and restore. To abandon an unfinished update, remove
 `/var/lib/node-setup/update.state` and restore the restart policy by hand
 (`docker update --restart=<policy> gpustack-worker`).
 
@@ -283,10 +326,11 @@ Never touched: crash dumps, irqbalance, BIOS and firmware, `crash-cleanup.*`,
 ## Commands and exit codes
 
 ```
-node-setup.sh                       menu: Check, Update, Clean up, Schedule, Bootstrap
+node-setup.sh                       menu: Check, Setup / Update, Clean up, Schedule
 node-setup.sh --check               read-only report of this node (exit 1 on problems)
 node-setup.sh --update [--dry-run]  guarded update; run again after the reboot
-node-setup.sh bootstrap [stages]    base repos nouveau driver cuda toolkit docker firewall lock
+node-setup.sh setup                new-node provisioning or existing-node guarded update
+node-setup.sh bootstrap [stages]    base disks repos nouveau driver cuda docker firewall toolkit; lock optional
 node-setup.sh maintenance           clean + update now
 node-setup.sh install [--timer]     deploy the script, config and schedule
 node-setup.sh uninstall             remove the schedule, keep script, config, logs
@@ -360,16 +404,15 @@ Still tight? Set `MAINT_DROP_RESCUE=1` to drop the `0-rescue` image.
   cn-002 — MENU
 ─────────────────────────────────────────────
   1) Check       health report, changes nothing
-  2) Update      remove version locks, drain GPUStack, upgrade, reboot
+  2) Setup / Update  new node: provision; existing node: guarded update
   3) Clean up    old kernels, caches, logs, unused containers
   4) Schedule    automatic maintenance: off
-  5) Bootstrap   set up a new node (driver, CUDA, docker)
   0) Exit
-Choose [0-5]:
+Choose [0-4]:
 ```
 
 After the reboot of an update, the menu says so and item 2 becomes
-`finish: verify, start GPUStack, watch 15 min`.
+`finish: verify, start GPUStack, restore restart policy`.
 
 Every step prints one line. The command output (dnf transactions, DKMS
 builds, depmod) goes to the log only, and on a failure the last lines of the
@@ -388,3 +431,14 @@ and keeps your `/etc/sysconfig/node-maintenance`. The old
 `/usr/local/sbin/node-maintenance.sh` and `bootstrap-gpu-node.sh` are left in
 place and no longer referenced — remove them by hand once the new schedule has
 run.
+
+## Local regression checks
+
+```bash
+bash -n node-setup.sh
+python3 -m unittest discover -s tests -v
+```
+
+These run without root and mock disk/package operations. Test on a Rocky 9 GPU
+node before fleet rollout; they do not validate actual DNF transactions, SELinux
+policy, GPU loading or reboot behavior.
